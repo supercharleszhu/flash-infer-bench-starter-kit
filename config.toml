@@ -7,3 +7,4 @@ author = "supercharleszhu"                    # Team/author name
 language = "cuda"                 # triton | cuda | python
 entry_point = "moe.cu::kernel"   # Format: file::function
 destination_passing_style = true  # kernel writes to pre-allocated output tensor
+binding = "torch"                 # torch | tvm-ffi — moe.cu uses torch/extension.h
