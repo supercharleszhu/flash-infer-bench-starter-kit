@@ -139,37 +139,49 @@ torch::Tensor run(
     }
     int padded_total = h_padded_offsets[NUM_LOCAL_EXPERTS];
 
-    // Gather FP8 activations per expert (padding rows stay zero from torch::zeros)
-    auto sorted_act_fp8_raw = torch::zeros({padded_total, HIDDEN_SIZE},
-                                            torch::dtype(torch::kUInt8).device(dev));
-    for (int e = 0; e < NUM_LOCAL_EXPERTS; e++) {
-        int Tk = h_counts[e];
-        if (Tk == 0) continue;
-        int src_offset = h_offsets[e];
-        int dst_offset = h_padded_offsets[e];
-        launch_gather_fp8_rows(
-            reinterpret_cast<const uint8_t*>(hidden_states.data_ptr()),
-            token_ids.data_ptr<int>() + src_offset,
-            (int)T, Tk, HIDDEN_SIZE,
-            sorted_act_fp8_raw.data_ptr<uint8_t>() + (int64_t)dst_offset * HIDDEN_SIZE,
-            stream);
+    // Build padded_token_ids [padded_total] on CPU: real positions get the
+    // original token id, padding positions get T (out-of-range sentinel).
+    // gather_fp8_rows writes zero when src_row >= T, so padding rows are zero.
+    // Also build padded_safe_ids (0 for padding) for SFA gather via index_select.
+    auto padded_ids_cpu = torch::full({padded_total}, (int)T, torch::kInt32);
+    auto padded_safe_cpu = torch::zeros({padded_total}, torch::kInt32);
+    auto padded_valid_cpu = torch::zeros({padded_total}, torch::kFloat32);
+    {
+        auto tid_cpu = token_ids.cpu();
+        auto tid = tid_cpu.data_ptr<int>();
+        auto pid = padded_ids_cpu.data_ptr<int>();
+        auto psafe = padded_safe_cpu.data_ptr<int>();
+        auto pval = padded_valid_cpu.data_ptr<float>();
+        for (int e = 0; e < NUM_LOCAL_EXPERTS; e++) {
+            int Tk = h_counts[e];
+            for (int j = 0; j < Tk; j++) {
+                int pos = h_padded_offsets[e] + j;
+                pid[pos]   = tid[h_offsets[e] + j];
+                psafe[pos] = tid[h_offsets[e] + j];
+                pval[pos]  = 1.0f;
+            }
+        }
     }
+    auto padded_token_ids = padded_ids_cpu.to(dev);
+    auto padded_safe_ids  = padded_safe_cpu.to(dev);
+    auto padded_valid     = padded_valid_cpu.to(dev);
+
+    // Single gather: sentinel=T makes padding rows zero in the kernel.
+    auto sorted_act_fp8_raw = torch::empty({padded_total, HIDDEN_SIZE},
+                                            torch::dtype(torch::kUInt8).device(dev));
+    launch_gather_fp8_rows(
+        reinterpret_cast<const uint8_t*>(hidden_states.data_ptr()),
+        padded_token_ids.data_ptr<int>(),
+        (int)T, padded_total, HIDDEN_SIZE,
+        sorted_act_fp8_raw.data_ptr<uint8_t>(), stream);
     auto sorted_act_fp8 = torch::from_blob(sorted_act_fp8_raw.data_ptr(),
         {padded_total, HIDDEN_SIZE}, torch::dtype(torch::kFloat8_e4m3fn).device(dev));
 
-    // SFA per expert (padding columns stay zero from torch::zeros)
+    // Single SFA gather via index_select using safe ids, mask zero padding cols.
     int64_t K_blocks = HIDDEN_SIZE / 128;
     auto hs_scale_cont = hidden_states_scale.contiguous();  // [K_blocks, T]
-    auto sfa = torch::zeros({K_blocks, (int64_t)padded_total},
-                             torch::dtype(torch::kFloat32).device(dev));
-    for (int e = 0; e < NUM_LOCAL_EXPERTS; e++) {
-        int Tk = h_counts[e];
-        if (Tk == 0) continue;
-        auto tok_ids_e = token_ids.slice(0, h_offsets[e], h_offsets[e] + Tk).to(torch::kLong);
-        auto scale_e = hs_scale_cont.index_select(1, tok_ids_e);
-        int dst_col = h_padded_offsets[e];
-        sfa.narrow(1, dst_col, Tk).copy_(scale_e);
-    }
+    auto sfa = hs_scale_cont.index_select(1, padded_safe_ids.to(torch::kLong)).contiguous();
+    sfa.mul_(padded_valid.unsqueeze(0));  // zero padding columns
 
     // SFB: permute from [E, N/128, K/128] to [E, K/128, N/128] (MN-major)
     auto sfb = gemm1_weights_scale.permute({0, 2, 1}).contiguous();
@@ -253,20 +265,30 @@ torch::Tensor run(
         expert_offsets_i64, problem_sizes2, NUM_LOCAL_EXPERTS
     );
 
-    // ── 9. Weighted accumulate per expert (padded layout → original token_ids) ──
-    auto output_f32 = torch::zeros({T, HIDDEN_SIZE}, torch::dtype(torch::kFloat32).device(dev));
-    for (int e = 0; e < NUM_LOCAL_EXPERTS; e++) {
-        int Tk = h_counts[e];
-        if (Tk == 0) continue;
-        int padded_start = h_padded_offsets[e];
-        int orig_start = h_offsets[e];
-        launch_accumulate_weighted_add(
-            gemm2_f32_out.data_ptr<float>() + (int64_t)padded_start * HIDDEN_SIZE,
-            token_ids.data_ptr<int>() + orig_start,
-            token_wts.data_ptr<float>() + orig_start,
-            Tk, HIDDEN_SIZE,
-            output_f32.data_ptr<float>(), stream);
+    // ── 9. Weighted accumulate (single atomic kernel over padded layout) ──
+    // padded_token_ids[i] = original token index for position i (T = padding).
+    // padded_token_wts[i]: set padded_valid × token_wts below to get 0 for padding.
+    auto padded_token_wts_cpu = torch::zeros({padded_total}, torch::kFloat32);
+    {
+        auto twt_cpu = token_wts.cpu();
+        auto twt = twt_cpu.data_ptr<float>();
+        auto pwt = padded_token_wts_cpu.data_ptr<float>();
+        for (int e = 0; e < NUM_LOCAL_EXPERTS; e++) {
+            int Tk = h_counts[e];
+            for (int j = 0; j < Tk; j++) {
+                pwt[h_padded_offsets[e] + j] = twt[h_offsets[e] + j];
+            }
+        }
     }
+    auto padded_token_wts = padded_token_wts_cpu.to(dev);
+
+    auto output_f32 = torch::zeros({T, HIDDEN_SIZE}, torch::dtype(torch::kFloat32).device(dev));
+    launch_accumulate_weighted_add_atomic(
+        gemm2_f32_out.data_ptr<float>(),
+        padded_token_ids.data_ptr<int>(),
+        padded_token_wts.data_ptr<float>(),
+        padded_total, HIDDEN_SIZE, (int)T,
+        output_f32.data_ptr<float>(), stream);
 
     return output_f32.to(torch::kBFloat16);
 }

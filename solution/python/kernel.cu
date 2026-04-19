@@ -267,7 +267,7 @@ __global__ void swiglu_kernel(
   C[row * INTERMEDIATE_SIZE + col] = silu * x1;
 }
 
-// 8) Accumulate O into output with weights
+// 8) Accumulate O into output with weights (non-atomic, used per-expert)
 __global__ void accumulate_weighted_add_kernel(
     const float* __restrict__ O,       // [Tk, H]
     const int* __restrict__ token_ids, // [Tk]
@@ -281,6 +281,25 @@ __global__ void accumulate_weighted_add_kernel(
   float w = weights[row];
   float val = O[row * H + col] * w;
   output[t * H + col] += val;
+}
+
+// 8b) Fused atomic accumulate — safe across experts sharing same token.
+// Use T_max as sentinel: padding rows with token_ids[i]==T_max are skipped.
+__global__ void accumulate_weighted_add_atomic_kernel(
+    const float* __restrict__ O,       // [N, H] — N = padded_total
+    const int* __restrict__ token_ids, // [N]  (T_max = padding sentinel)
+    const float* __restrict__ weights, // [N]  (0.0 for padding)
+    int N, int H, int T_max,
+    float* __restrict__ output) {      // [T_max, H]
+  int row = blockIdx.z * gridDim.y + blockIdx.y;
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N || col >= H) return;
+  int t = token_ids[row];
+  if (t < 0 || t >= T_max) return;   // skip padding
+  float w = weights[row];
+  if (w == 0.0f) return;              // skip zero-weight
+  float val = O[row * H + col] * w;
+  atomicAdd(&output[t * H + col], val);
 }
 
 // Launchers
@@ -376,6 +395,20 @@ void launch_accumulate_weighted_add(
   if (Tk > 0) {
     accumulate_weighted_add_kernel<<<grid, block, 0, stream>>>(
         O, token_ids, weights, Tk, H, output);
+    CUDA_CHECK(cudaGetLastError());
+  }
+}
+
+// Atomic version — safe when multiple rows (different experts, same token)
+// write to the same output token. Use T_max as padding sentinel.
+void launch_accumulate_weighted_add_atomic(
+    const float* O, const int* token_ids, const float* weights,
+    int N, int H, int T_max, float* output, cudaStream_t stream) {
+  dim3 block(256);
+  dim3 grid = make_row_grid((H + block.x - 1) / block.x, N);
+  if (N > 0) {
+    accumulate_weighted_add_atomic_kernel<<<grid, block, 0, stream>>>(
+        O, token_ids, weights, N, H, T_max, output);
     CUDA_CHECK(cudaGetLastError());
   }
 }

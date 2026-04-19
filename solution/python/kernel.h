@@ -103,6 +103,16 @@ void launch_accumulate_weighted_add(
     float* __restrict__ output,         // [T, H]
     cudaStream_t stream);
 
+// 8b) Atomic version — safe across experts sharing tokens. Row i is skipped if
+// token_ids[i] >= T_max or out of range, and if weights[i] == 0.
+void launch_accumulate_weighted_add_atomic(
+    const float* __restrict__ O,        // [N, H] (N = padded_total)
+    const int* __restrict__ token_ids,  // [N]   (T_max = padding sentinel)
+    const float* __restrict__ weights,  // [N]   (0.0 for padding)
+    int N, int H, int T_max,
+    float* __restrict__ output,         // [T_max, H]
+    cudaStream_t stream);
+
 // 9a) Fused FP8 dequant to BF16 (half bandwidth vs FP32)
 void launch_fused_dequant_experts_bf16(
     const uint8_t* __restrict__ w_fp8,
