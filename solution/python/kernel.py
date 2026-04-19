@@ -62,7 +62,9 @@ def _build_extension():
     if _mod is not None:
         return _mod
 
-    # Source files live alongside kernel.py (flashinfer-bench flattens the directory).
+    # Source files live alongside kernel.py. flashinfer-bench's
+    # pack_solution_from_files doesn't recurse, so nested csrc/ subdirs would
+    # get dropped when the solution is packed/replayed in worker processes.
     src_dir = pathlib.Path(__file__).parent
     sources = [
         str(src_dir / "main.cpp"),
@@ -107,13 +109,14 @@ def kernel(
 ):
     """MoE forward pass using CUTLASS SM100a grouped GEMM."""
     mod = _build_extension()
-    result = mod.run(
+    # C++ writes directly into the pre-allocated DPS output tensor,
+    # avoiding an intermediate bf16 allocation + Python-level copy.
+    mod.run(
         routing_logits, routing_bias,
         hidden_states, hidden_states_scale,
         gemm1_weights, gemm1_weights_scale,
         gemm2_weights, gemm2_weights_scale,
         int(local_expert_offset),
         float(routed_scaling_factor),
+        output,
     )
-    # Copy result into pre-allocated DPS output
-    output.copy_(result)

@@ -68,7 +68,7 @@ void cutlass_moe_gemm_fp8_blockwise(
 // Main entry
 // ═══════════════════════════════════════════════════════════════════════════════
 
-torch::Tensor run(
+void run(
     torch::Tensor routing_logits,
     torch::Tensor routing_bias,
     torch::Tensor hidden_states,         // [T, H] fp8
@@ -78,7 +78,8 @@ torch::Tensor run(
     torch::Tensor gemm2_weights,         // [E, H, I] fp8
     torch::Tensor gemm2_weights_scale,   // [E, H/128, I/128] float32
     int64_t local_expert_offset,
-    double routed_scaling_factor
+    double routed_scaling_factor,
+    torch::Tensor output                 // [T, H] bfloat16 (DPS, pre-allocated)
 ) {
     TORCH_CHECK(routing_logits.is_cuda() && hidden_states.is_cuda());
     const int64_t T = routing_logits.size(0);
@@ -115,7 +116,8 @@ torch::Tensor run(
     for (int i = 0; i < NUM_LOCAL_EXPERTS; i++) h_offsets[i+1] = h_offsets[i] + h_counts[i];
 
     if (total_assign == 0) {
-        return torch::zeros({T, HIDDEN_SIZE}, torch::dtype(torch::kBFloat16).device(dev));
+        output.zero_();
+        return;
     }
 
     auto d_offsets = torch::empty({NUM_LOCAL_EXPERTS}, torch::dtype(torch::kInt32).device(dev));
@@ -290,7 +292,8 @@ torch::Tensor run(
         padded_total, HIDDEN_SIZE, (int)T,
         output_f32.data_ptr<float>(), stream);
 
-    return output_f32.to(torch::kBFloat16);
+    // Write directly into the pre-allocated DPS output tensor (bf16).
+    output.copy_(output_f32);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
