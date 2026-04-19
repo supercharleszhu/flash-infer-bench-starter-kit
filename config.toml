@@ -1,7 +1,7 @@
 [solution]
 name = "moe-cutlass"                                                            # Solution name
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"     # fused_moe track
-author = "hui"                                                                   # Team/author name
+author = "supercharleszhu"                                                       # Team/author name
 
 [build]
 language = "python"               # triton | cuda | python
