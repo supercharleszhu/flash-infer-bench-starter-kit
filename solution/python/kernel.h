@@ -103,6 +103,20 @@ void launch_accumulate_weighted_add(
     float* __restrict__ output,         // [T, H]
     cudaStream_t stream);
 
+// 8c) Build padded arrays on GPU (eliminates .cpu() syncs in main.cpp).
+// Inputs are GPU arrays; outputs are GPU arrays of size padded_offsets[E_local].
+void launch_build_padded_arrays(
+    const int* unpadded_offsets,      // [E+1] int32 cumulative
+    const int* padded_offsets,        // [E+1] int32 cumulative
+    const int* token_ids,             // [total_assign] int32
+    const float* token_wts,           // [total_assign] float32
+    int T_sentinel, int E_local,
+    int* padded_token_ids,            // out: [padded_total] T for padding
+    int* padded_safe_ids,             // out: [padded_total] 0 for padding
+    float* padded_valid,              // out: [padded_total] 0.0 for padding
+    float* padded_token_wts_out,      // out: [padded_total] 0.0 for padding
+    cudaStream_t stream);
+
 // 8b) Atomic version — safe across experts sharing tokens. Row i is skipped if
 // token_ids[i] >= T_max or out of range, and if weights[i] == 0.
 void launch_accumulate_weighted_add_atomic(

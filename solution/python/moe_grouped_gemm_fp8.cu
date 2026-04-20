@@ -478,58 +478,63 @@ void cutlass_moe_gemm_fp8(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 __global__ void setup_tf32_pointers(
-    int64_t* expert_offsets, int num_experts,
+    const int* padded_offsets, int num_experts,  // [num_experts+1] int32 cumulative
     float** a_ptrs, float** b_ptrs, float** out_ptrs,
+    ProblemShape::UnderlyingProblemShape* problem_sizes,  // [num_experts]
     float* a_base, float* b_base, float* out_base,
-    int64_t N, int64_t K)
+    int N, int K)
 {
     int e = threadIdx.x;
     if (e >= num_experts) return;
-    int64_t off = expert_offsets[e];
-    a_ptrs[e] = a_base + off * K;
-    b_ptrs[e] = b_base + (int64_t)e * N * K;
-    out_ptrs[e] = out_base + off * N;
+    int off = padded_offsets[e];
+    int m   = padded_offsets[e + 1] - off;
+    a_ptrs[e]   = a_base   + (int64_t)off * K;
+    b_ptrs[e]   = b_base   + (int64_t)e * N * K;
+    out_ptrs[e] = out_base + (int64_t)off * N;
+    problem_sizes[e] = ProblemShape::UnderlyingProblemShape(m, N, K);
 }
 
 void cutlass_moe_gemm_tf32(
     torch::Tensor& output,              // [total_tokens, N] fp32
     torch::Tensor const& activations,   // [total_tokens, K] fp32
     torch::Tensor const& weights,       // [E, N, K] fp32 (pre-dequanted)
-    torch::Tensor const& expert_offsets, // [E] int64
-    torch::Tensor const& problem_sizes, // [E, 3] int32
+    torch::Tensor const& padded_offsets, // [E+1] int32 cumulative
     int num_experts
 ) {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     auto stream = at::cuda::getCurrentCUDAStream(activations.device().index());
     auto dev = activations.device();
     auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(dev);
+    auto opts_byte = torch::TensorOptions().dtype(torch::kByte).device(dev);
 
     int64_t N = output.size(1);
     int64_t K = activations.size(1);
 
-    // Pointer arrays
+    // Pointer arrays + problem-shape storage, filled in-device from padded_offsets.
     auto a_ptrs = torch::empty(num_experts, opts_i64);
     auto b_ptrs = torch::empty(num_experts, opts_i64);
     auto out_ptrs = torch::empty(num_experts, opts_i64);
+    auto d_problem_sizes = torch::empty(
+        {(int64_t)(num_experts * sizeof(ProblemShape::UnderlyingProblemShape))}, opts_byte);
 
     setup_tf32_pointers<<<1, num_experts, 0, stream>>>(
-        static_cast<int64_t*>(expert_offsets.data_ptr()), num_experts,
+        padded_offsets.data_ptr<int>(), num_experts,
         reinterpret_cast<float**>(a_ptrs.data_ptr()),
         reinterpret_cast<float**>(b_ptrs.data_ptr()),
         reinterpret_cast<float**>(out_ptrs.data_ptr()),
+        reinterpret_cast<ProblemShape::UnderlyingProblemShape*>(d_problem_sizes.data_ptr()),
         static_cast<float*>(activations.data_ptr()),
         static_cast<float*>(weights.data_ptr()),
         static_cast<float*>(output.data_ptr()),
-        N, K);
+        (int)N, (int)K);
 
     // Strides
     auto strides_a = torch::full({num_experts}, K, opts_i64);
     auto strides_b = torch::full({num_experts}, K, opts_i64);
     auto strides_c = torch::full({num_experts}, N, opts_i64);
 
-    // Problem shape
     ProblemShape::UnderlyingProblemShape* prob_shapes =
-        static_cast<ProblemShape::UnderlyingProblemShape*>(problem_sizes.data_ptr());
+        reinterpret_cast<ProblemShape::UnderlyingProblemShape*>(d_problem_sizes.data_ptr());
     ProblemShape prob_shape{num_experts, prob_shapes, nullptr};
 
     typename TF32_Gemm::GemmKernel::MainloopArguments mainloop_args{

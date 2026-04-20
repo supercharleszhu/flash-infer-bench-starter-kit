@@ -399,6 +399,67 @@ void launch_accumulate_weighted_add(
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Build padded arrays on GPU — removes the need for .cpu() calls.
+// Produces padded_token_ids (T = padding sentinel), padded_safe_ids (0 for
+// padding — safe for index_select), padded_valid (1.0 real / 0.0 padding),
+// padded_token_wts (routing weight / 0.0 padding).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+__global__ void build_padded_arrays_kernel(
+    const int*   __restrict__ unpadded_offsets, // [E+1] int32 cumulative
+    const int*   __restrict__ padded_offsets,   // [E+1] int32 cumulative
+    const int*   __restrict__ token_ids,         // [total_assign] int32
+    const float* __restrict__ token_wts,         // [total_assign] float32
+    int T_sentinel, int E_local,
+    int*   padded_token_ids,
+    int*   padded_safe_ids,
+    float* padded_valid,
+    float* padded_token_wts_out)
+{
+    // One block per expert; threads iterate over padded positions for that expert.
+    int e = blockIdx.x;
+    if (e >= E_local) return;
+
+    int src_base = unpadded_offsets[e];
+    int real_count = unpadded_offsets[e + 1] - src_base;
+    int dst_base = padded_offsets[e];
+    int padded_count = padded_offsets[e + 1] - dst_base;
+
+    for (int j = threadIdx.x; j < padded_count; j += blockDim.x) {
+        int dst = dst_base + j;
+        if (j < real_count) {
+            int tid = token_ids[src_base + j];
+            float w = token_wts[src_base + j];
+            padded_token_ids[dst]     = tid;
+            padded_safe_ids[dst]      = tid;
+            padded_valid[dst]         = 1.0f;
+            padded_token_wts_out[dst] = w;
+        } else {
+            padded_token_ids[dst]     = T_sentinel;
+            padded_safe_ids[dst]      = 0;
+            padded_valid[dst]         = 0.0f;
+            padded_token_wts_out[dst] = 0.0f;
+        }
+    }
+}
+
+void launch_build_padded_arrays(
+    const int* unpadded_offsets, const int* padded_offsets,
+    const int* token_ids, const float* token_wts,
+    int T_sentinel, int E_local,
+    int* padded_token_ids, int* padded_safe_ids,
+    float* padded_valid, float* padded_token_wts_out,
+    cudaStream_t stream)
+{
+    build_padded_arrays_kernel<<<E_local, 128, 0, stream>>>(
+        unpadded_offsets, padded_offsets,
+        token_ids, token_wts,
+        T_sentinel, E_local,
+        padded_token_ids, padded_safe_ids, padded_valid, padded_token_wts_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Atomic version — safe when multiple rows (different experts, same token)
 // write to the same output token. Use T_max as padding sentinel.
 void launch_accumulate_weighted_add_atomic(

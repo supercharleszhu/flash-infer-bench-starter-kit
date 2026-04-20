@@ -20,6 +20,29 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <vector>
 #include <algorithm>
+#include <unordered_map>
+
+// Cached per-device dequant stream and sync events. Lazily created on first
+// use, never destroyed (process lifetime). Replaces the per-call
+// cudaStreamCreate / cudaEventCreate / destroy pairs (~100μs aggregate).
+// Events use cudaEventDisableTiming since they are sync-only.
+struct DequantScratch {
+    cudaStream_t stream;
+    cudaEvent_t  ready;       // main-stream → dequant-stream handshake
+    cudaEvent_t  done;        // dequant-stream → main-stream handshake
+};
+
+static DequantScratch& get_dequant_scratch(int device_id) {
+    static std::unordered_map<int, DequantScratch> cache;
+    auto it = cache.find(device_id);
+    if (it != cache.end()) return it->second;
+    DequantScratch s;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&s.ready, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&s.done,  cudaEventDisableTiming));
+    cache[device_id] = s;
+    return cache[device_id];
+}
 
 // Forward declarations (defined in moe_grouped_gemm_fp8.cu)
 void cutlass_moe_gemm_bf16(
@@ -35,8 +58,7 @@ void cutlass_moe_gemm_tf32(
     torch::Tensor& output,
     torch::Tensor const& activations,
     torch::Tensor const& weights,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
+    torch::Tensor const& padded_offsets,  // [E+1] int32 cumulative
     int num_experts
 );
 
@@ -120,19 +142,28 @@ void run(
         return;
     }
 
-    auto d_offsets = torch::empty({NUM_LOCAL_EXPERTS}, torch::dtype(torch::kInt32).device(dev));
-    CUDA_CHECK(cudaMemcpyAsync(d_offsets.data_ptr<int>(), h_offsets.data(),
-               sizeof(int)*NUM_LOCAL_EXPERTS, cudaMemcpyHostToDevice, stream));
+    // Upload unpadded cumulative offsets [E+1] to device. We need TWO copies:
+    //   d_fill_offsets:      mutated in-place by fill_local_assignments (atomics)
+    //   d_unpadded_offsets:  read-only copy for build_padded_arrays below
+    std::vector<int> h_offsets_int(NUM_LOCAL_EXPERTS + 1, 0);
+    for (int i = 0; i <= NUM_LOCAL_EXPERTS; i++) h_offsets_int[i] = h_offsets[i];
+    auto d_fill_offsets = torch::empty({NUM_LOCAL_EXPERTS + 1}, torch::dtype(torch::kInt32).device(dev));
+    auto d_unpadded_offsets = torch::empty({NUM_LOCAL_EXPERTS + 1}, torch::dtype(torch::kInt32).device(dev));
+    CUDA_CHECK(cudaMemcpyAsync(d_fill_offsets.data_ptr<int>(), h_offsets_int.data(),
+               sizeof(int)*(NUM_LOCAL_EXPERTS+1), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_unpadded_offsets.data_ptr<int>(), h_offsets_int.data(),
+               sizeof(int)*(NUM_LOCAL_EXPERTS+1), cudaMemcpyHostToDevice, stream));
+
     auto token_ids = torch::empty({total_assign}, torch::dtype(torch::kInt32).device(dev));
     auto token_wts = torch::empty({total_assign}, torch::dtype(torch::kFloat32).device(dev));
     launch_fill_local_assignments(
         topk_idx.data_ptr<int>(), topk_w.data_ptr<float>(),
         (int)T, (int)local_expert_offset,
-        d_offsets.data_ptr<int>(), token_ids.data_ptr<int>(), token_wts.data_ptr<float>(),
+        d_fill_offsets.data_ptr<int>(),  // mutable; gets incremented atomically
+        token_ids.data_ptr<int>(), token_wts.data_ptr<float>(),
         stream);
 
-    // ── 3. Build padded layout and gather in ONE pass (no per-expert loops) ──
-    // Pad each expert's count to a multiple of 4 (CUTLASS TMA requirement)
+    // ── 3. Build padded layout (offsets on CPU cheap; padded arrays on GPU) ──
     std::vector<int> h_padded_counts(NUM_LOCAL_EXPERTS);
     std::vector<int> h_padded_offsets(NUM_LOCAL_EXPERTS + 1, 0);
     for (int i = 0; i < NUM_LOCAL_EXPERTS; i++) {
@@ -141,32 +172,26 @@ void run(
     }
     int padded_total = h_padded_offsets[NUM_LOCAL_EXPERTS];
 
-    // Build padded_token_ids [padded_total] on CPU: real positions get the
-    // original token id, padding positions get T (out-of-range sentinel).
-    // gather_fp8_rows writes zero when src_row >= T, so padding rows are zero.
-    // Also build padded_safe_ids (0 for padding) for SFA gather via index_select.
-    auto padded_ids_cpu = torch::full({padded_total}, (int)T, torch::kInt32);
-    auto padded_safe_cpu = torch::zeros({padded_total}, torch::kInt32);
-    auto padded_valid_cpu = torch::zeros({padded_total}, torch::kFloat32);
-    {
-        auto tid_cpu = token_ids.cpu();
-        auto tid = tid_cpu.data_ptr<int>();
-        auto pid = padded_ids_cpu.data_ptr<int>();
-        auto psafe = padded_safe_cpu.data_ptr<int>();
-        auto pval = padded_valid_cpu.data_ptr<float>();
-        for (int e = 0; e < NUM_LOCAL_EXPERTS; e++) {
-            int Tk = h_counts[e];
-            for (int j = 0; j < Tk; j++) {
-                int pos = h_padded_offsets[e] + j;
-                pid[pos]   = tid[h_offsets[e] + j];
-                psafe[pos] = tid[h_offsets[e] + j];
-                pval[pos]  = 1.0f;
-            }
-        }
-    }
-    auto padded_token_ids = padded_ids_cpu.to(dev);
-    auto padded_safe_ids  = padded_safe_cpu.to(dev);
-    auto padded_valid     = padded_valid_cpu.to(dev);
+    auto d_padded_offsets = torch::empty({NUM_LOCAL_EXPERTS + 1}, torch::dtype(torch::kInt32).device(dev));
+    CUDA_CHECK(cudaMemcpyAsync(d_padded_offsets.data_ptr<int>(), h_padded_offsets.data(),
+               sizeof(int)*(NUM_LOCAL_EXPERTS+1), cudaMemcpyHostToDevice, stream));
+
+    // Build padded arrays on GPU (no token_ids.cpu() sync needed).
+    auto padded_token_ids = torch::empty({padded_total}, torch::dtype(torch::kInt32).device(dev));
+    auto padded_safe_ids  = torch::empty({padded_total}, torch::dtype(torch::kInt32).device(dev));
+    auto padded_valid     = torch::empty({padded_total}, torch::dtype(torch::kFloat32).device(dev));
+    auto padded_token_wts = torch::empty({padded_total}, torch::dtype(torch::kFloat32).device(dev));
+    launch_build_padded_arrays(
+        d_unpadded_offsets.data_ptr<int>(),
+        d_padded_offsets.data_ptr<int>(),
+        token_ids.data_ptr<int>(),
+        token_wts.data_ptr<float>(),
+        (int)T, NUM_LOCAL_EXPERTS,
+        padded_token_ids.data_ptr<int>(),
+        padded_safe_ids.data_ptr<int>(),
+        padded_valid.data_ptr<float>(),
+        padded_token_wts.data_ptr<float>(),
+        stream);
 
     // Single gather: sentinel=T makes padding rows zero in the kernel.
     auto sorted_act_fp8_raw = torch::empty({padded_total, HIDDEN_SIZE},
@@ -188,11 +213,9 @@ void run(
     // SFB: permute from [E, N/128, K/128] to [E, K/128, N/128] (MN-major)
     auto sfb = gemm1_weights_scale.permute({0, 2, 1}).contiguous();
 
-    // m_indptr: [NUM_LOCAL_EXPERTS+1] int32, padded cumulative offsets
-    auto m_indptr_cpu = torch::empty({NUM_LOCAL_EXPERTS + 1}, torch::kInt32);
-    for (int i = 0; i <= NUM_LOCAL_EXPERTS; i++)
-        m_indptr_cpu[i] = h_padded_offsets[i];
-    auto m_indptr = m_indptr_cpu.to(dev);
+    // m_indptr: [NUM_LOCAL_EXPERTS+1] int32, padded cumulative offsets.
+    // d_padded_offsets already holds this on device — reuse it directly.
+    auto& m_indptr = d_padded_offsets;
 
     // ── 5. GEMM1: FP8 blockwise grouped GEMM ──
     auto gemm1_out = torch::empty({padded_total, GEMM1_OUT_SIZE},
@@ -203,14 +226,15 @@ void run(
         if (h_counts[e] > 0) active_experts.push_back(e);
 
     // ── W2 dequant on separate stream (overlaps with FP8 GEMM1) ──
-    cudaStream_t dequant_stream;
-    cudaStreamCreate(&dequant_stream);
-    cudaEvent_t ready_event;
-    cudaEventCreate(&ready_event);
-    cudaEventRecord(ready_event, stream);
-    cudaStreamWaitEvent(dequant_stream, ready_event, 0);
+    // Reuse cached stream + events; per-call create/destroy costs ~100μs total.
+    auto& scratch = get_dequant_scratch(dev.index());
+    cudaStream_t dequant_stream = scratch.stream;
+    cudaEventRecord(scratch.ready, stream);
+    cudaStreamWaitEvent(dequant_stream, scratch.ready, 0);
 
-    auto w2_f32 = torch::zeros({NUM_LOCAL_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE},
+    // empty (not zeros): launch_fused_dequant_experts writes all active-expert
+    // slices; inactive experts have M_e=0 so CUTLASS never reads their weights.
+    auto w2_f32 = torch::empty({NUM_LOCAL_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE},
                                 torch::dtype(torch::kFloat32).device(dev));
     if (!active_experts.empty()) {
         auto d_active = torch::tensor(active_experts, torch::dtype(torch::kInt32).device(dev));
@@ -234,56 +258,24 @@ void run(
                   swiglu_f32.data_ptr<float>(), stream);
 
     // ── Wait for W2 dequant to finish before GEMM2 ──
-    cudaEvent_t dequant_done;
-    cudaEventCreate(&dequant_done);
-    cudaEventRecord(dequant_done, dequant_stream);
-    cudaStreamWaitEvent(stream, dequant_done, 0);
-    cudaEventDestroy(ready_event);
-    cudaEventDestroy(dequant_done);
-    cudaStreamDestroy(dequant_stream);
+    cudaEventRecord(scratch.done, dequant_stream);
+    cudaStreamWaitEvent(stream, scratch.done, 0);
+    // stream + events are cached; do not destroy
 
     // ── 8. GEMM2: TF32 grouped GEMM using padded layout ──
-    auto expert_offsets_i64 = torch::empty({NUM_LOCAL_EXPERTS}, torch::dtype(torch::kInt64).device(dev));
-    {
-        auto eo_cpu = torch::empty({NUM_LOCAL_EXPERTS}, torch::kInt64);
-        for (int e = 0; e < NUM_LOCAL_EXPERTS; e++) eo_cpu[e] = h_padded_offsets[e];
-        expert_offsets_i64.copy_(eo_cpu);
-    }
-    auto problem_sizes2 = torch::empty({NUM_LOCAL_EXPERTS, 3}, torch::dtype(torch::kInt32).device(dev));
-    {
-        auto ps2_cpu = torch::empty({NUM_LOCAL_EXPERTS, 3}, torch::kInt32);
-        for (int e = 0; e < NUM_LOCAL_EXPERTS; e++) {
-            ps2_cpu[e][0] = h_padded_counts[e];  // padded M
-            ps2_cpu[e][1] = HIDDEN_SIZE;
-            ps2_cpu[e][2] = INTERMEDIATE_SIZE;
-        }
-        problem_sizes2.copy_(ps2_cpu);
-    }
-
-    auto gemm2_f32_out = torch::zeros({padded_total, HIDDEN_SIZE},
+    // Pass d_padded_offsets directly — cutlass_moe_gemm_tf32 now builds pointer
+    // and problem-shape arrays on device from the int32 cumulative offsets.
+    // empty (not zeros): GEMM2 beta=0 overwrites every active row; padding rows
+    // have token_wts=0 in the downstream accumulate so their value is unused.
+    auto gemm2_f32_out = torch::empty({padded_total, HIDDEN_SIZE},
                                        torch::dtype(torch::kFloat32).device(dev));
     cutlass_moe_gemm_tf32(
         gemm2_f32_out, swiglu_f32, w2_f32,
-        expert_offsets_i64, problem_sizes2, NUM_LOCAL_EXPERTS
+        d_padded_offsets, NUM_LOCAL_EXPERTS
     );
 
     // ── 9. Weighted accumulate (single atomic kernel over padded layout) ──
-    // padded_token_ids[i] = original token index for position i (T = padding).
-    // padded_token_wts[i]: set padded_valid × token_wts below to get 0 for padding.
-    auto padded_token_wts_cpu = torch::zeros({padded_total}, torch::kFloat32);
-    {
-        auto twt_cpu = token_wts.cpu();
-        auto twt = twt_cpu.data_ptr<float>();
-        auto pwt = padded_token_wts_cpu.data_ptr<float>();
-        for (int e = 0; e < NUM_LOCAL_EXPERTS; e++) {
-            int Tk = h_counts[e];
-            for (int j = 0; j < Tk; j++) {
-                pwt[h_padded_offsets[e] + j] = twt[h_offsets[e] + j];
-            }
-        }
-    }
-    auto padded_token_wts = padded_token_wts_cpu.to(dev);
-
+    // padded_token_wts is already built on GPU by launch_build_padded_arrays.
     auto output_f32 = torch::zeros({T, HIDDEN_SIZE}, torch::dtype(torch::kFloat32).device(dev));
     launch_accumulate_weighted_add_atomic(
         gemm2_f32_out.data_ptr<float>(),
