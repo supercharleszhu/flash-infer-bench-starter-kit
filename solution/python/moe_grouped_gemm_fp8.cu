@@ -199,8 +199,26 @@ using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
 using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
 using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
-// 1SM tile — safe for all batch sizes (even 1 token per expert)
-using FI_TileShape    = Shape<_128, _128, _128>;
+// [B200 optimization — Phase #1] Tile_M = 64 for small-seq SM utilization.
+//
+// Most experts at small seq have 4-32 tokens. With tile_M=128 we waste 75-95%
+// of each tile on padding and only get 1-5 grid blocks total — nowhere near
+// the 148 SMs on B200. tile_M=64 doubles M-parallelism at small seq, which
+// is where flashinfer crushes us by 100-200×. CUTLASS's CLC scheduler on SM100
+// already provides the "persistent" CTA dispatch CUTLASS users get for free,
+// so the only knob we need to turn is tile size.
+//
+// Trade-off vs Phase 2a (2-SM cluster + multicast): the 2Sm schedule requires
+// tile_M ≥ 128 (each cluster CTA needs ≥64 rows, 2-CTA cluster needs ≥1 full
+// warpgroup), so we can't combine multicast with tile_M=64. We pick tile_M=64
+// because the small-seq win (~3-5×) outweighs the large-seq cost from losing
+// multicast (~5-10%). This is the contest's geo-mean ranking — small seq is
+// disproportionately important.
+//
+// Future work: dual-dispatch — fi_gemm_small (this) for T<256 + fi_gemm_large
+// (tile=128, cluster=2, 2Sm) for T≥256. ~150 LOC of duplicated CUTLASS types
+// + a runtime branch in main.cpp.
+using FI_TileShape    = Shape<_64, _128, _128>;
 using FI_ClusterShape = Shape<_1, _1, _1>;
 
 using FI_KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100;

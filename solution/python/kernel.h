@@ -2,6 +2,8 @@
 #define MOE_FP8_BLOCK_SCALE_DS_ROUTING_TOPK8_NG8_KG4_E32_H7168_I2048_KERNEL_H_
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cstdint>
 
 // B200-tuned constants for this specialized kernel
@@ -68,6 +70,17 @@ void launch_count_local_assignments(
     int* __restrict__ counts,          // [32], zero-initialized
     cudaStream_t stream);
 
+// 4a) [Phase #2] Device-side prefix scan: counts[E_local] → offsets[E_local+1].
+// Replaces the CPU-sync + .cpu() + host prefix sum + H2D memcpy block in main.cpp.
+// Emits TWO copies of unpadded offsets: a read-only copy for build_padded_arrays
+// and a mutable copy that fill_local_assignments increments via atomicAdd.
+void launch_compute_offsets(
+    const int* counts,                 // [E_local]
+    int* unpadded_offsets,             // [E_local+1] out, read-only
+    int* unpadded_offsets_atomic,      // [E_local+1] out, mutable
+    int* padded_offsets,               // [E_local+1] out
+    cudaStream_t stream);
+
 // 5) Fill flat assignment lists using prefix offsets (atomic on-device)
 void launch_fill_local_assignments(
     const int* __restrict__ topk_idx,   // [T, 8]
@@ -92,6 +105,17 @@ void launch_swiglu(
     const float* __restrict__ G1,   // [Tk, 4096]
     int Tk,
     float* __restrict__ C,          // [Tk, 2048]
+    cudaStream_t stream);
+
+// 7b) Fused SwiGLU + FP8 blockwise quantization — replaces launch_swiglu on the
+// FP8 GEMM2 path. Emits fp8 output + per-128-K-block scales in CUTLASS SFA
+// layout (column-major [I/128, padded_total]). Feeds directly into
+// cutlass_moe_gemm_fp8_blockwise as A + SFA for GEMM2.
+void launch_swiglu_quantize_fp8(
+    const float* G1,               // [padded_total, 2*I] fp32
+    int padded_total,
+    uint8_t* C_fp8,                // [padded_total, I] fp8 e4m3 bytes
+    float* scales,                 // [I/128, padded_total] fp32, col-major
     cudaStream_t stream);
 
 // 8) Accumulate O[Tk,H] into output[T,H] by token_ids and weights (no atomics if sequential per expert)
@@ -125,6 +149,17 @@ void launch_accumulate_weighted_add_atomic(
     const float* __restrict__ weights,  // [N]   (0.0 for padding)
     int N, int H, int T_max,
     float* __restrict__ output,         // [T_max, H]
+    cudaStream_t stream);
+
+// 8d) Fused weighted scatter directly into bf16 output (Phase 3b).
+// Uses atomicAdd(__nv_bfloat162*) — native on SM90+. Replaces 8b followed by a
+// fp32→bf16 cast. Caller must zero-init `output` before the launch. H must be even.
+void launch_scatter_weighted_bf16_atomic(
+    const float* __restrict__ O,        // [N, H] fp32
+    const int* __restrict__ token_ids,  // [N]
+    const float* __restrict__ weights,  // [N]
+    int N, int H, int T_max,
+    __nv_bfloat16* __restrict__ output, // [T_max, H] bf16 (pre-zeroed)
     cudaStream_t stream);
 
 // 9a) Fused FP8 dequant to BF16 (half bandwidth vs FP32)
