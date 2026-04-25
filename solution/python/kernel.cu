@@ -133,45 +133,60 @@ __global__ void noaux_routing_topk8_kernel(
   }
   __syncthreads();
 
-  // Merge 64 candidates to top-8 globally
-  if (threadIdx.x == 0) {
-    float temp_val[ROUTE_NUM_GROUP * ROUTE_TOP_K];
-    int   temp_idx[ROUTE_NUM_GROUP * ROUTE_TOP_K];
-    float temp_snb[ROUTE_NUM_GROUP * ROUTE_TOP_K];
+  // Merge 64 candidates → top-8 globally using WARP-PARALLEL top-k.
+  // Previously serialized on thread 0 (~512 sequential ops). Warp-parallel
+  // version: each lane holds 2 candidates, 8 iterations of warp_max.
+  // ~6× faster on the merge step.
+  if (warp == 0) {
+    // 64 candidates / 32 lanes = 2 per lane.
+    float v0 = warpCandVal[lane * 2 + 0];
+    float v1 = warpCandVal[lane * 2 + 1];
+    int   i0 = warpCandIdx[lane * 2 + 0];
+    int   i1 = warpCandIdx[lane * 2 + 1];
+    float s0 = warpCandSNoBias[lane * 2 + 0];
+    float s1 = warpCandSNoBias[lane * 2 + 1];
 
-    #pragma unroll
-    for (int i = 0; i < ROUTE_NUM_GROUP * ROUTE_TOP_K; ++i) {
-      temp_val[i] = warpCandVal[i];
-      temp_idx[i] = warpCandIdx[i];
-      temp_snb[i] = warpCandSNoBias[i];
-    }
-
-    float sel_s[ROUTE_TOP_K];
-    int sel_idx[ROUTE_TOP_K];
+    __shared__ int   sel_idx_sh[ROUTE_TOP_K];
+    __shared__ float sel_s_sh  [ROUTE_TOP_K];
 
     #pragma unroll
     for (int j = 0; j < ROUTE_TOP_K; ++j) {
-      int best_i = 0;
-      float best_v = temp_val[0];
-      #pragma unroll
-      for (int i = 1; i < ROUTE_NUM_GROUP * ROUTE_TOP_K; ++i) {
-        if (temp_val[i] > best_v) { best_v = temp_val[i]; best_i = i; }
+      // Each lane's "current best" between its 2 candidates.
+      bool pick0 = (v0 >= v1);
+      float v = pick0 ? v0 : v1;
+      // Warp-wide max → global value across 64 candidates.
+      float gmax = warp_max(v);
+      // Find which lane holds the max (ties broken by lowest lane).
+      unsigned msk = __ballot_sync(0xffffffffu, v == gmax);
+      int winner = __ffs(msk) - 1;
+      // Read the winner's index and s_no_bias.
+      int   sel_i = pick0 ? i0 : i1;
+      float sel_s = pick0 ? s0 : s1;
+      int   sel_i_bcast = __shfl_sync(0xffffffffu, sel_i,  winner);
+      float sel_s_bcast = __shfl_sync(0xffffffffu, sel_s,  winner);
+      if (lane == 0) {
+        sel_idx_sh[j] = sel_i_bcast;
+        sel_s_sh[j]   = sel_s_bcast;
       }
-      sel_idx[j] = temp_idx[best_i];
-      sel_s[j] = temp_snb[best_i];
-      temp_val[best_i] = -CUDART_INF_F;
+      // Winner lane: mark its used candidate as consumed.
+      if (lane == winner) {
+        if (pick0) v0 = -CUDART_INF_F;
+        else       v1 = -CUDART_INF_F;
+      }
     }
 
-    // Normalize weights using s (no bias)
-    float sumw = 0.f;
-    #pragma unroll
-    for (int j = 0; j < ROUTE_TOP_K; ++j) sumw += sel_s[j];
-    sumw = fmaxf(sumw, 1e-20f);
-    #pragma unroll
-    for (int j = 0; j < ROUTE_TOP_K; ++j) {
-      float w = (sel_s[j] / sumw) * routed_scaling_factor;
-      topk_idx[t * ROUTE_TOP_K + j] = sel_idx[j];
-      topk_w[t * ROUTE_TOP_K + j] = w;
+    // Normalize and write — single thread.
+    if (lane == 0) {
+      float sumw = 0.f;
+      #pragma unroll
+      for (int j = 0; j < ROUTE_TOP_K; ++j) sumw += sel_s_sh[j];
+      sumw = fmaxf(sumw, 1e-20f);
+      #pragma unroll
+      for (int j = 0; j < ROUTE_TOP_K; ++j) {
+        float w = (sel_s_sh[j] / sumw) * routed_scaling_factor;
+        topk_idx[t * ROUTE_TOP_K + j] = sel_idx_sh[j];
+        topk_w  [t * ROUTE_TOP_K + j] = w;
+      }
     }
   }
 }
@@ -259,6 +274,40 @@ __global__ void fill_local_assignments_kernel(
       int pos = atomicAdd(&offsets_inout[le], 1);
       token_ids_out[pos] = t;
       token_w_out[pos] = topk_w[base + k];
+    }
+  }
+}
+
+// Variant that ALSO emits inverse map (token, k) → padded_slot for finalize kernel.
+// Eliminates the need for atomic scatter at the end of the pipeline.
+__global__ void fill_local_assignments_with_inverse_kernel(
+    const int* __restrict__ topk_idx,
+    const float* __restrict__ topk_w,
+    int T,
+    int local_expert_offset,
+    int* __restrict__ offsets_inout,         // [32], running unpadded counters
+    const int* __restrict__ unpadded_offsets,// [33] read-only base offsets
+    const int* __restrict__ padded_offsets,  // [33] read-only base offsets
+    int* __restrict__ token_ids_out,         // [total_assign]
+    float* __restrict__ token_w_out,         // [total_assign]
+    int* __restrict__ inv_padded_slot)       // [T, topK]  -1 if non-local
+{
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= T) return;
+  int base = t * ROUTE_TOP_K;
+  #pragma unroll
+  for (int k = 0; k < ROUTE_TOP_K; ++k) {
+    int ge = topk_idx[base + k];
+    int le = ge - local_expert_offset;
+    if ((unsigned)le < (unsigned)NUM_LOCAL_EXPERTS) {
+      int unp_pos = atomicAdd(&offsets_inout[le], 1);
+      token_ids_out[unp_pos] = t;
+      token_w_out[unp_pos] = topk_w[base + k];
+      // Map unpadded → padded: padded_pos = padded_off[le] + (unp_pos - unp_off[le])
+      int padded_pos = padded_offsets[le] + (unp_pos - unpadded_offsets[le]);
+      inv_padded_slot[base + k] = padded_pos;
+    } else {
+      inv_padded_slot[base + k] = -1;
     }
   }
 }
@@ -367,6 +416,35 @@ __global__ void scatter_weighted_bf16_atomic_kernel(
     atomicAdd(out_ptr, val);
 }
 
+// BF16-input variant: GEMM2 output is now bf16 (half the I/O at large seq).
+__global__ void scatter_weighted_bf16_from_bf16_kernel(
+    const __nv_bfloat16* __restrict__ O,          // [N, H] bf16 GEMM2 output
+    const int*           __restrict__ token_ids,  // [N]
+    const float*         __restrict__ weights,    // [N]
+    int N, int H, int T_max,
+    __nv_bfloat16*       __restrict__ output)     // [T_max, H] bf16
+{
+    int row  = blockIdx.z * gridDim.y + blockIdx.y;
+    int col2 = blockIdx.x * blockDim.x + threadIdx.x;
+    int col  = col2 * 2;
+    if (row >= N || col >= H) return;
+
+    int t = token_ids[row];
+    if (t < 0 || t >= T_max) return;
+    float w = weights[row];
+    if (w == 0.0f) return;
+
+    // Vectorized bf16x2 load → fp32 multiply by weight → bf16x2 atomic add.
+    auto* in_ptr = reinterpret_cast<const __nv_bfloat162*>(O + (size_t)row * H + col);
+    __nv_bfloat162 v_in = *in_ptr;
+    float v0 = __bfloat162float(v_in.x) * w;
+    float v1 = __bfloat162float(v_in.y) * w;
+    __nv_bfloat162 val = __floats2bfloat162_rn(v0, v1);
+
+    auto* out_ptr = reinterpret_cast<__nv_bfloat162*>(output + (size_t)t * H + col);
+    atomicAdd(out_ptr, val);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // [B200 optimization — Phase #2] Device-side prefix scan over local-expert counts.
 //
@@ -385,16 +463,17 @@ __global__ void scatter_weighted_bf16_atomic_kernel(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 __global__ void compute_offsets_kernel(
-    const int* __restrict__ counts,           // [E_local]
-    int* __restrict__ unpadded_offsets,       // [E_local+1] out — read-only after this
-    int* __restrict__ unpadded_offsets_atomic,// [E_local+1] out — mutable for fill kernel
-    int* __restrict__ padded_offsets)         // [E_local+1] out
+    const int* __restrict__ counts,
+    int* __restrict__ unpadded_offsets,
+    int* __restrict__ unpadded_offsets_atomic,
+    int* __restrict__ padded_offsets,
+    int pad_align)   // 4 (small seq) or 64 (large seq, M=64 GEMM2)
 {
     static_assert(NUM_LOCAL_EXPERTS == 32, "kernel assumes E_local == 32 (single warp)");
     int tid = threadIdx.x;
 
     int c  = counts[tid];
-    int pc = (c + 3) & ~3;     // round up to multiple of 4
+    int pc = (c + pad_align - 1) & ~(pad_align - 1);
 
     // Inclusive warp scan via shfl_up_sync.
     int unp = c, pad = pc;
@@ -422,10 +501,10 @@ __global__ void compute_offsets_kernel(
 void launch_compute_offsets(
     const int* counts,
     int* unpadded_offsets, int* unpadded_offsets_atomic, int* padded_offsets,
-    cudaStream_t stream)
+    cudaStream_t stream, int pad_align)
 {
     compute_offsets_kernel<<<1, NUM_LOCAL_EXPERTS, 0, stream>>>(
-        counts, unpadded_offsets, unpadded_offsets_atomic, padded_offsets);
+        counts, unpadded_offsets, unpadded_offsets_atomic, padded_offsets, pad_align);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -490,6 +569,22 @@ void launch_fill_local_assignments(
   int blocks = (T + threads - 1) / threads;
   fill_local_assignments_kernel<<<blocks, threads, 0, stream>>>(
       topk_idx, topk_w, T, local_expert_offset, offsets_inout, token_ids_out, token_w_out);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_fill_local_assignments_with_inverse(
+    const int* topk_idx, const float* topk_w, int T, int local_expert_offset,
+    int* offsets_inout,
+    const int* unpadded_offsets, const int* padded_offsets,
+    int* token_ids_out, float* token_w_out,
+    int* inv_padded_slot,
+    cudaStream_t stream) {
+  int threads = 256;
+  int blocks = (T + threads - 1) / threads;
+  fill_local_assignments_with_inverse_kernel<<<blocks, threads, 0, stream>>>(
+      topk_idx, topk_w, T, local_expert_offset,
+      offsets_inout, unpadded_offsets, padded_offsets,
+      token_ids_out, token_w_out, inv_padded_slot);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -613,6 +708,72 @@ void launch_scatter_weighted_bf16_atomic(
     if (N > 0) {
         scatter_weighted_bf16_atomic_kernel<<<grid, block, 0, stream>>>(
             O, token_ids, weights, N, H, T_max, output);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void launch_scatter_weighted_bf16_from_bf16(
+    const __nv_bfloat16* O, const int* token_ids, const float* weights,
+    int N, int H, int T_max, __nv_bfloat16* output, cudaStream_t stream) {
+    dim3 block(256);
+    dim3 grid = make_row_grid(((H / 2) + block.x - 1) / block.x, N);
+    if (N > 0) {
+        scatter_weighted_bf16_from_bf16_kernel<<<grid, block, 0, stream>>>(
+            O, token_ids, weights, N, H, T_max, output);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Non-atomic finalize: gather topK rows of GEMM2 output for each token, sum
+// with weights, write bf16. Replaces atomic scatter (1.65ms → ~0.4ms at
+// seq=14107). Mirrors flashinfer's finalizeKernelVecLoad approach.
+//
+// Grid: (H/(threads*2), T)  Block: 256 threads, each handles 2 cols (bf16x2).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+__global__ void finalize_weighted_bf16_kernel(
+    const float*         __restrict__ gemm2_out,    // [N, H] fp32
+    const int*           __restrict__ inv_slot,     // [T, topK]
+    const float*         __restrict__ topk_weights, // [T, topK]
+    int H,
+    __nv_bfloat16*       __restrict__ output)       // [T, H]
+{
+    int t    = blockIdx.y;
+    int col2 = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (col2 >= H) return;
+
+    int   slots[ROUTE_TOP_K];
+    float wts[ROUTE_TOP_K];
+    #pragma unroll
+    for (int k = 0; k < ROUTE_TOP_K; k++) {
+        slots[k] = inv_slot[t * ROUTE_TOP_K + k];
+        wts[k]   = topk_weights[t * ROUTE_TOP_K + k];
+    }
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < ROUTE_TOP_K; k++) {
+        if (slots[k] < 0) continue;
+        const float* row = gemm2_out + (size_t)slots[k] * H + col2;
+        acc0 += wts[k] * row[0];
+        acc1 += wts[k] * row[1];
+    }
+
+    auto* out_pair = reinterpret_cast<__nv_bfloat162*>(output + (size_t)t * H + col2);
+    *out_pair = __floats2bfloat162_rn(acc0, acc1);
+}
+
+void launch_finalize_weighted_bf16(
+    const float* gemm2_out, const int* inv_slot, const float* topk_weights,
+    int T, int H, __nv_bfloat16* output, cudaStream_t stream)
+{
+    // Each thread handles 2 cols (bf16x2). H must be even (DeepSeek H=7168).
+    dim3 block(256);
+    dim3 grid(((H / 2) + block.x - 1) / block.x, T);
+    if (T > 0) {
+        finalize_weighted_bf16_kernel<<<grid, block, 0, stream>>>(
+            gemm2_out, inv_slot, topk_weights, H, output);
         CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -801,8 +962,8 @@ void launch_quantize_fp8_blockwise(
 
 __global__ void swiglu_quantize_fp8_kernel(
     const float* __restrict__ G1,      // [padded_total, 2*I] fp32, GEMM1 output
-    uint8_t*    __restrict__ C_fp8,    // [padded_total, I] fp8 e4m3
-    float*      __restrict__ scales,   // [I/128, padded_total] fp32 column-major
+    uint8_t*    __restrict__ C_fp8,       // [padded_total, I] fp8 e4m3
+    float*      __restrict__ scales,      // [I/128, padded_total] fp32 column-major
     int padded_total)
 {
     const int I = INTERMEDIATE_SIZE;                   // 2048
@@ -876,6 +1037,170 @@ void launch_swiglu_quantize_fp8(
     dim3 grid = make_row_grid(INTERMEDIATE_SIZE / 128, padded_total);
     dim3 block(128);
     LAUNCH_PDL(swiglu_quantize_fp8_kernel, grid, block, 0, stream,
+               G1, C_fp8, scales, padded_total);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 9e) In-place FP8 dequant + M=64 requant for GEMM1 activations.
+//
+// The sorted activations are FP8 with per-token per-K-block scales in
+// sfa[K//128, padded_total] (col-major). This kernel "absorbs" those per-token
+// scales into the FP8 values and produces coarser M=64 block scales, eliminating
+// 3,584 strided scale loads per GEMM1 tile (down to 56).
+//
+// Grid: (H/128, padded_total/64)  Block: 128 threads (one per K-col in block).
+// padded_total must be multiple of 64 (guaranteed by large-seq padding).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+__global__ void fp8_absorb_token_scale_m64_kernel(
+    uint8_t*     __restrict__ act_fp8,      // [padded_total, H] fp8 e4m3, in-place
+    const float* __restrict__ per_tok_sfa,  // [H//128, padded_total] col-major
+    float*       __restrict__ new_sfa_m64,  // [H//128, padded_total//64] output
+    int padded_total)
+{
+    const int H        = HIDDEN_SIZE;
+    const int m_tile   = blockIdx.y;    // 0 .. padded_total/64 - 1
+    const int k_block  = blockIdx.x;    // 0 .. H/128 - 1
+    const int tid      = threadIdx.x;   // 0 .. 127 (one per K-col in block)
+    const int base_row = m_tile * 64;
+    const int col      = k_block * 128 + tid;
+
+    // Per-token SFA for this K-block, 64 rows: col-major → stride 1 in M.
+    const float* sfa_row = per_tok_sfa + (size_t)k_block * padded_total + base_row;
+
+    // Load 64 fp8 values and dequant.
+    float vals[64];
+    float my_max = 0.0f;
+    #pragma unroll 8
+    for (int r = 0; r < 64; r++) {
+        float fp8v = fp8_e4m3fn_to_float_fast(act_fp8[(size_t)(base_row + r) * H + col]);
+        float v    = fp8v * sfa_row[r];  // per-token dequant
+        vals[r]    = v;
+        my_max     = fmaxf(my_max, fabsf(v));
+    }
+
+    // 128-thread warp reduce.
+    float m = my_max;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+    __shared__ float warp_max[4];
+    if ((tid & 31) == 0) warp_max[tid >> 5] = m;
+    __syncthreads();
+    if ((tid >> 5) == 0) {
+        float v = (tid < 4) ? warp_max[tid] : 0.0f;
+        #pragma unroll
+        for (int off = 2; off > 0; off >>= 1)
+            v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+        if (tid == 0) warp_max[0] = v;
+    }
+    __syncthreads();
+    const float absmax    = warp_max[0];
+    const float new_scale = (absmax > 0.0f) ? (absmax / FP8_E4M3_MAX) : 1.0f;
+    const float inv_scale = 1.0f / new_scale;
+
+    // Re-quantize FP8 in-place.
+    #pragma unroll 8
+    for (int r = 0; r < 64; r++)
+        act_fp8[(size_t)(base_row + r) * H + col] = float_to_fp8_e4m3(vals[r] * inv_scale);
+
+    // Write M=64 block scale: [H//128, padded_total//64] col-major.
+    if (tid == 0)
+        new_sfa_m64[(size_t)k_block * (padded_total / 64) + m_tile] = new_scale;
+}
+
+void launch_fp8_absorb_token_scale_m64(
+    uint8_t* act_fp8, const float* per_tok_sfa,
+    float* new_sfa_m64, int padded_total, cudaStream_t stream)
+{
+    dim3 grid(HIDDEN_SIZE / 128, padded_total / 64);
+    dim3 block(128);
+    fp8_absorb_token_scale_m64_kernel<<<grid, block, 0, stream>>>(
+        act_fp8, per_tok_sfa, new_sfa_m64, padded_total);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 9d) Fused SwiGLU + FP8 quantize with M=64 tile-granularity A scales.
+//
+// Replaces 9c for GEMM2 when fi_gemm_m64 (Sm100BlockwiseScaleConfig<64,...>)
+// is used. One CUDA block handles 64 rows × 128 K-cols, emitting a single
+// scale for the whole tile instead of one per token row.
+//
+// Why M=64 reduces register pressure: CUTLASS mainloop loads 1 scale per
+// K-block (instead of tile_M=64 scales), eliminating 63 per-K-block loads and
+// the bookkeeping registers that track them. Measured: 168→? reg/thread.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+__global__ void swiglu_quantize_fp8_m64_kernel(
+    const float* __restrict__ G1,      // [padded_total, 2*I] fp32
+    uint8_t*    __restrict__ C_fp8,       // [padded_total, I]
+    float*      __restrict__ scales,      // [I/128, padded_total/64] col-major
+    int padded_total)
+{
+    const int I         = INTERMEDIATE_SIZE;
+    const int row_tile  = blockIdx.y;   // 0 .. padded_total/64 - 1
+    const int block_col = blockIdx.x;   // 0 .. I/128 - 1
+    const int tid       = threadIdx.x;  // 0 .. 127 (one per col in the 128-wide K-block)
+    const int base_row  = row_tile * 64;
+    const int col       = block_col * 128 + tid;
+
+    // Load and compute SwiGLU for all 64 rows in this column.
+    // Keep results in registers for the second write pass.
+    float vals[64];
+    float my_max = 0.0f;
+    #pragma unroll 8
+    for (int r = 0; r < 64; r++) {
+        const float* row_ptr = G1 + (size_t)(base_row + r) * (2 * I);
+        float x1   = row_ptr[col];
+        float x2   = row_ptr[col + I];
+        float silu = x2 / (1.0f + __expf(-x2));
+        float out  = silu * x1;
+        vals[r]    = out;
+        my_max     = fmaxf(my_max, fabsf(out));
+    }
+
+    // Warp-reduce my_max (128 threads = 4 warps).
+    float m = my_max;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+
+    __shared__ float warp_max[4];
+    if ((tid & 31) == 0) warp_max[tid >> 5] = m;
+    __syncthreads();
+    if ((tid >> 5) == 0) {
+        float v = (tid < 4) ? warp_max[tid] : 0.0f;
+        #pragma unroll
+        for (int off = 2; off > 0; off >>= 1)
+            v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+        if (tid == 0) warp_max[0] = v;
+    }
+    __syncthreads();
+    const float absmax   = warp_max[0];
+    const float scale    = (absmax > 0.0f) ? (absmax / FP8_E4M3_MAX) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+
+    // Write 64 FP8 values for my column.
+    #pragma unroll 8
+    for (int r = 0; r < 64; r++)
+        C_fp8[(size_t)(base_row + r) * I + col] = float_to_fp8_e4m3(vals[r] * inv_scale);
+
+    // One scale per 64×128 tile. Layout: [I/128, padded_total/64] col-major.
+    // scales[block_col, row_tile] → index = block_col * (padded_total/64) + row_tile
+    if (tid == 0)
+        scales[(size_t)block_col * (padded_total / 64) + row_tile] = scale;
+}
+
+void launch_swiglu_quantize_fp8_m64(
+    const float* G1, int padded_total,
+    uint8_t* C_fp8, float* scales, cudaStream_t stream)
+{
+    // padded_total must be a multiple of 64 (guaranteed by compute_offsets_kernel).
+    // PDL: the consumer GEMM2 (CUTLASS PDL-aware) starts its prologue before
+    // this kernel's tail flushes, overlapping ~0.1-0.3ms with GEMM2 setup.
+    dim3 grid(INTERMEDIATE_SIZE / 128, padded_total / 64);
+    dim3 block(128);
+    LAUNCH_PDL(swiglu_quantize_fp8_m64_kernel, grid, block, 0, stream,
                G1, C_fp8, scales, padded_total);
 }
 

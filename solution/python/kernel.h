@@ -79,7 +79,8 @@ void launch_compute_offsets(
     int* unpadded_offsets,             // [E_local+1] out, read-only
     int* unpadded_offsets_atomic,      // [E_local+1] out, mutable
     int* padded_offsets,               // [E_local+1] out
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int pad_align = 4);                // 4 (small seq) or 64 (large seq, M=64 GEMM2)
 
 // 5) Fill flat assignment lists using prefix offsets (atomic on-device)
 void launch_fill_local_assignments(
@@ -90,6 +91,17 @@ void launch_fill_local_assignments(
     int* __restrict__ offsets_inout,    // [32], device-side running offsets (initialized with prefix "offsets")
     int* __restrict__ token_ids_out,    // [total_assignments]
     float* __restrict__ token_w_out,    // [total_assignments]
+    cudaStream_t stream);
+
+// 5a) Same as 5 but also writes inverse map (token, k) → padded_slot for
+// non-atomic finalize. -1 marks non-local (token,k) pairs.
+void launch_fill_local_assignments_with_inverse(
+    const int* topk_idx, const float* topk_w, int T, int local_expert_offset,
+    int* offsets_inout,
+    const int* unpadded_offsets,
+    const int* padded_offsets,
+    int* token_ids_out, float* token_w_out,
+    int* inv_padded_slot,
     cudaStream_t stream);
 
 // 6) Gather rows from [T, H] by token_ids to a compact [Tk, H]
@@ -116,6 +128,25 @@ void launch_swiglu_quantize_fp8(
     int padded_total,
     uint8_t* C_fp8,                // [padded_total, I] fp8 e4m3 bytes
     float* scales,                 // [I/128, padded_total] fp32, col-major
+    cudaStream_t stream);
+
+// 7c) Same as 7b but M=64 tile-granularity A scales (one per 64-row × 128-K block).
+// Feeds cutlass_moe_gemm_fp8_m64_blockwise. padded_total must be multiple of 64.
+void launch_swiglu_quantize_fp8_m64(
+    const float* G1,               // [padded_total, 2*I] fp32
+    int padded_total,
+    uint8_t* C_fp8,                // [padded_total, I] fp8 e4m3 bytes
+    float* scales,                 // [I/128, padded_total/64] fp32, col-major
+    cudaStream_t stream);
+
+// 7d) In-place FP8 dequant + M=64 requant for GEMM1 sorted activations.
+// Absorbs per-token sfa into FP8 values; emits M=64 block scales for fi_gemm_m64.
+// padded_total must be multiple of 64 (guaranteed by large-seq padding).
+void launch_fp8_absorb_token_scale_m64(
+    uint8_t* act_fp8,                  // [padded_total, H] fp8 in-place
+    const float* per_tok_sfa,          // [H//128, padded_total] col-major
+    float* new_sfa_m64,                // [H//128, padded_total//64] output
+    int padded_total,
     cudaStream_t stream);
 
 // 8) Accumulate O[Tk,H] into output[T,H] by token_ids and weights (no atomics if sequential per expert)
@@ -160,6 +191,26 @@ void launch_scatter_weighted_bf16_atomic(
     const float* __restrict__ weights,  // [N]
     int N, int H, int T_max,
     __nv_bfloat16* __restrict__ output, // [T_max, H] bf16 (pre-zeroed)
+    cudaStream_t stream);
+
+// 8e) BF16-input variant of 8d. Used when GEMM2 outputs bf16 directly (large-seq
+// path with fi_gemm_m64 BF16 epilogue). Halves scatter input I/O.
+void launch_scatter_weighted_bf16_from_bf16(
+    const __nv_bfloat16* __restrict__ O,
+    const int* __restrict__ token_ids,
+    const float* __restrict__ weights,
+    int N, int H, int T_max,
+    __nv_bfloat16* __restrict__ output,
+    cudaStream_t stream);
+
+// 8f) Non-atomic finalize: per-token gather of topK GEMM2 rows + weighted sum.
+// Replaces atomic scatter — flashinfer-style. Eliminates atomicAdd contention.
+void launch_finalize_weighted_bf16(
+    const float* __restrict__ gemm2_out,    // [N, H] fp32
+    const int* __restrict__ inv_slot,       // [T, topK] -1 for non-local
+    const float* __restrict__ topk_weights, // [T, topK]
+    int T, int H,
+    __nv_bfloat16* __restrict__ output,     // [T, H] bf16 (no zero-init needed — overwrite)
     cudaStream_t stream);
 
 // 9a) Fused FP8 dequant to BF16 (half bandwidth vs FP32)

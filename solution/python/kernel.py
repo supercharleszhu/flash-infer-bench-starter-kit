@@ -1,14 +1,12 @@
 """
-CUTLASS MoE kernel — FP8 block-scale DeepSeek-V3 routing, SM100a grouped GEMM.
+CUTLASS MoE kernel v3 — experimental variant of moe_cutlass_v2.
 
 Definition : moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 Language   : python  (JIT-compiles CUDA/CUTLASS extension at runtime)
 DPS        : true  (output pre-allocated bfloat16 [T, H], passed as last arg)
 Entry      : kernel.py::kernel
 
-The Python entry point JIT-compiles the C++/CUDA sources using
-torch.utils.cpp_extension.load(), pulling CUTLASS headers from flashinfer.
-This allows us to control the CUTLASS version and compile flags.
+moe_cutlass_v2 is kept frozen. Experimental changes go here (moe_cutlass_v3).
 """
 
 import os
@@ -80,7 +78,7 @@ def _build_extension():
     gencode = _detect_cuda_arch()
 
     _mod = cpp_ext.load(
-        name="moe_cutlass_ext",
+        name="moe_cutlass_v3_ext",
         sources=sources,
         extra_cuda_cflags=[
             gencode,

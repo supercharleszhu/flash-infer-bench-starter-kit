@@ -46,6 +46,17 @@ void cutlass_moe_gemm_fp8_blockwise(
     int num_groups
 );
 
+// M=64 tile-granularity variant for GEMM2. SFA = [K//128, cum_m//64].
+void cutlass_moe_gemm_fp8_m64_blockwise(
+    torch::Tensor& output,          // [cum_m, N] fp32
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& SFA,       // [K//128, cum_m//64] fp32
+    torch::Tensor const& SFB,       // [num_groups, K//128, N//128] fp32
+    torch::Tensor const& m_indptr,  // [num_groups+1] int32 (multiples of 64)
+    int num_groups
+);
+
 // (No per-row scale conversion needed — blockwise CUTLASS handles per-K-block scales directly)
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -82,18 +93,17 @@ void run(
         topk_idx.data_ptr<int>(), topk_w.data_ptr<float>(), stream);
 
     // ── 2. Count local assignments + device-side prefix scan ──
-    // [B200 optimization — Phase #2] No more CPU sync. We compute all offsets on
-    // device via launch_compute_offsets (single warp, ~1µs) and over-allocate
-    // downstream buffers at worst-case bound. Saves ~20-50 µs per call.
-    //
-    // Worst-case bounds (no sync needed — T comes from tensor dim, known on host):
-    //   max_assign  = T * TOP_K           (every (token,k) pair lands locally)
-    //   max_padded  = T * TOP_K + E_local * 3   (each expert may pad up to 3 rows)
-    //
-    // Memory waste: at seq=14107, max_padded ≈ true padded_total. At seq=1,
-    // we over-alloc by ~100 rows × 7168B = 700KB — trivial vs the GEMMs.
     const int max_assign = (int)T * ROUTE_TOP_K;
-    const int max_padded = max_assign + NUM_LOCAL_EXPERTS * 3;
+
+    // Dual-path: small seq uses 4-token padding (identical to cutlass_v2);
+    // large seq uses 64-token padding to enable M=64 tile-scale GEMM2.
+    // Threshold: max_assign >= 16000 (~seq≥2000) where 64-pad overhead ≤5%.
+    static constexpr int LARGE_SEQ_THRESHOLD = 16000;
+    const bool large_seq = (max_assign >= LARGE_SEQ_THRESHOLD);
+    const int  pad_align = large_seq ? 64 : 4;
+    const int  pad_max_overhead = large_seq ? (NUM_LOCAL_EXPERTS * 63) : (NUM_LOCAL_EXPERTS * 3);
+    // Round max_padded up to a multiple of pad_align (required for SFA stride exactness).
+    const int max_padded = (max_assign + pad_max_overhead + pad_align - 1) & ~(pad_align - 1);
 
     auto counts = torch::zeros({NUM_LOCAL_EXPERTS}, torch::dtype(torch::kInt32).device(dev));
     launch_count_local_assignments(
@@ -106,20 +116,27 @@ void run(
     launch_compute_offsets(
         counts.data_ptr<int>(),
         d_unpadded_offsets.data_ptr<int>(),
-        d_fill_offsets.data_ptr<int>(),       // mutable copy — fill kernel will atomicAdd
+        d_fill_offsets.data_ptr<int>(),
         d_padded_offsets.data_ptr<int>(),
-        stream);
+        stream, pad_align);
 
     // Allocate at worst-case, padded_token_ids defaults to T (sentinel) so
     // unused rows are skipped by every downstream kernel. token_wts defaults
     // to 0.0 for the same reason.
     auto token_ids = torch::empty({max_assign}, torch::dtype(torch::kInt32).device(dev));
     auto token_wts = torch::empty({max_assign}, torch::dtype(torch::kFloat32).device(dev));
-    launch_fill_local_assignments(
+    // Inverse map (token, k) → padded_slot, used by non-atomic finalize.
+    // Init to -1 (sentinel) so non-local (t,k) pairs are skipped.
+    auto inv_slot = torch::full({(int64_t)T * ROUTE_TOP_K}, -1,
+                                torch::dtype(torch::kInt32).device(dev));
+    launch_fill_local_assignments_with_inverse(
         topk_idx.data_ptr<int>(), topk_w.data_ptr<float>(),
         (int)T, (int)local_expert_offset,
-        d_fill_offsets.data_ptr<int>(),     // mutable; atomic fill counters
+        d_fill_offsets.data_ptr<int>(),       // mutable; atomic fill counters
+        d_unpadded_offsets.data_ptr<int>(),   // read-only base offsets
+        d_padded_offsets.data_ptr<int>(),     // read-only base offsets
         token_ids.data_ptr<int>(), token_wts.data_ptr<float>(),
+        inv_slot.data_ptr<int>(),
         stream);
 
     // ── 3. Build padded layout (all on GPU) ──
@@ -175,10 +192,8 @@ void run(
     auto& m_indptr = d_padded_offsets;
 
     // ── 5. GEMM1: FP8 blockwise grouped GEMM ──
-    // fp8×fp8 → fp32, per-token A scale + 128×128 B scale, SM100 TCGEN05 cores.
     auto gemm1_out = torch::empty({padded_total, GEMM1_OUT_SIZE},
                                     torch::dtype(torch::kFloat32).device(dev));
-
     cutlass_moe_gemm_fp8_blockwise(
         gemm1_out, sorted_act_fp8, gemm1_weights, sfa, sfb, m_indptr, NUM_LOCAL_EXPERTS
     );
@@ -196,53 +211,60 @@ void run(
     // (atol=1, rtol=0.3, matched@0.9) with wide margin.
     auto swiglu_fp8_raw = torch::empty({padded_total, INTERMEDIATE_SIZE},
                                         torch::dtype(torch::kUInt8).device(dev));
-    auto swiglu_scales = torch::empty({INTERMEDIATE_SIZE / 128, padded_total},
-                                        torch::dtype(torch::kFloat32).device(dev));
-    launch_swiglu_quantize_fp8(
-        gemm1_out.data_ptr<float>(), padded_total,
-        swiglu_fp8_raw.data_ptr<uint8_t>(),
-        swiglu_scales.data_ptr<float>(),
-        stream);
-
-    // Reinterpret uint8 storage as fp8_e4m3fn for CUTLASS (zero-copy dtype view).
-    auto swiglu_fp8 = torch::from_blob(
-        swiglu_fp8_raw.data_ptr(),
-        {padded_total, INTERMEDIATE_SIZE},
-        torch::dtype(torch::kFloat8_e4m3fn).device(dev));
-
-    // SFB for GEMM2: CUTLASS expects [E, K/128, N/128] MN-major, but the caller
-    // provides gemm2_weights_scale as [E, H/128, I/128] = [E, N/128, K/128].
-    // Swap the last two dims. TODO: cache by data_ptr — weights are immutable
-    // across benchmark calls so this permute can amortize to zero.
     auto sfb_g2 = gemm2_weights_scale.permute({0, 2, 1}).contiguous();
 
-    // ── 7. GEMM2: FP8 blockwise grouped GEMM (replaces TF32 path) ──
-    // Same CUTLASS wrapper as GEMM1 — Sm100BlockwiseScaleConfig<1,128,128>
-    // handles both GEMMs identically. M=padded_total, N=H=7168, K=I=2048.
     auto gemm2_out = torch::empty({padded_total, HIDDEN_SIZE},
                                    torch::dtype(torch::kFloat32).device(dev));
-    cutlass_moe_gemm_fp8_blockwise(
-        gemm2_out, swiglu_fp8, gemm2_weights,
-        swiglu_scales, sfb_g2, d_padded_offsets, NUM_LOCAL_EXPERTS
-    );
 
-    // ── 8. Fused weighted scatter directly into bf16 output ──
-    // [B200 optimization — Phase 3b] Replaces the old (alloc fp32 output_f32 →
-    // atomic-add fp32 → output.copy_(fp32→bf16)) triad with one atomic bf16x2
-    // scatter. Saves the [T,H] fp32 tensor (~200 MB at seq=14107) and the
-    // torch cast-copy pass over it. Native atomicAdd(__nv_bfloat162*) on SM90+.
-    //
-    // Caller provides `output` pre-allocated; we zero it in-place (one memset)
-    // then atomic-add into it. Padding rows contribute nothing via the sentinel
-    // (token_id≥T) and zero-weight guards inside the kernel.
-    output.zero_();
-    launch_scatter_weighted_bf16_atomic(
-        gemm2_out.data_ptr<float>(),
-        padded_token_ids.data_ptr<int>(),
-        padded_token_wts.data_ptr<float>(),
-        padded_total, HIDDEN_SIZE, (int)T,
-        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-        stream);
+    if (large_seq) {
+        auto swiglu_scales = torch::empty({INTERMEDIATE_SIZE / 128, padded_total / 64},
+                                           torch::dtype(torch::kFloat32).device(dev));
+        launch_swiglu_quantize_fp8_m64(
+            gemm1_out.data_ptr<float>(), padded_total,
+            swiglu_fp8_raw.data_ptr<uint8_t>(),
+            swiglu_scales.data_ptr<float>(), stream);
+        auto swiglu_fp8 = torch::from_blob(swiglu_fp8_raw.data_ptr(),
+            {padded_total, INTERMEDIATE_SIZE}, torch::dtype(torch::kFloat8_e4m3fn).device(dev));
+        cutlass_moe_gemm_fp8_m64_blockwise(
+            gemm2_out, swiglu_fp8, gemm2_weights,
+            swiglu_scales, sfb_g2, d_padded_offsets, NUM_LOCAL_EXPERTS);
+    } else {
+        auto swiglu_scales = torch::empty({INTERMEDIATE_SIZE / 128, padded_total},
+                                           torch::dtype(torch::kFloat32).device(dev));
+        launch_swiglu_quantize_fp8(
+            gemm1_out.data_ptr<float>(), padded_total,
+            swiglu_fp8_raw.data_ptr<uint8_t>(),
+            swiglu_scales.data_ptr<float>(), stream);
+        auto swiglu_fp8 = torch::from_blob(swiglu_fp8_raw.data_ptr(),
+            {padded_total, INTERMEDIATE_SIZE}, torch::dtype(torch::kFloat8_e4m3fn).device(dev));
+        cutlass_moe_gemm_fp8_blockwise(
+            gemm2_out, swiglu_fp8, gemm2_weights,
+            swiglu_scales, sfb_g2, d_padded_offsets, NUM_LOCAL_EXPERTS);
+    }
+
+    // ── 8. Output reduction ──
+    // Large seq: non-atomic finalize (per-token gather of topK rows + weighted sum).
+    //   Replaces atomic scatter at seq=14107: 1.65ms → 0.4ms (saves 1.2ms).
+    // Small seq: atomic scatter — the atomic contention is small enough that
+    //   the gather-finalize launch overhead dominates and finalize is slower.
+    if (large_seq) {
+        launch_finalize_weighted_bf16(
+            gemm2_out.data_ptr<float>(),
+            inv_slot.data_ptr<int>(),
+            topk_w.data_ptr<float>(),
+            (int)T, HIDDEN_SIZE,
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            stream);
+    } else {
+        output.zero_();
+        launch_scatter_weighted_bf16_atomic(
+            gemm2_out.data_ptr<float>(),
+            padded_token_ids.data_ptr<int>(),
+            padded_token_wts.data_ptr<float>(),
+            padded_total, HIDDEN_SIZE, (int)T,
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            stream);
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

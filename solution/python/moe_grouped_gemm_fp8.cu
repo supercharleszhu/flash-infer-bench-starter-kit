@@ -224,7 +224,8 @@ using FI_ClusterShape = Shape<_1, _1, _1>;
 using FI_KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100;
 using FI_EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
 
-// Output fp32 (needed for SwiGLU)
+// Output fp32 (BF16 was tried but regressed ~3-5%: SM100 BF16 epilogue overhead
+// exceeds the bandwidth saving from halving the intermediate buffer size).
 using FI_ElementD = float;
 using FI_LayoutD  = cutlass::layout::RowMajor;
 static constexpr int FI_AlignmentD = 128 / cutlass::sizeof_bits<FI_ElementD>::value;
@@ -261,6 +262,61 @@ using FI_StrideB = typename FI_Gemm::GemmKernel::InternalStrideB;
 using FI_StrideD = typename FI_Gemm::GemmKernel::InternalStrideD;
 
 }  // namespace fi_gemm
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// fi_gemm_m64: same as fi_gemm but A scale granularity M=64 (one scale per
+// 64-token × 128-K tile). CUTLASS loads 1 scale per K-block instead of 64,
+// eliminating per-token scale tracking from the mainloop registers.
+// Used for GEMM2 (SwiGLU output quantized with M=64 tiles by
+// launch_swiglu_quantize_fp8_m64). GEMM1 still uses fi_gemm (M=1).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace fi_gemm_m64 {
+
+using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
+    64, 128, 128, UMMA::Major::MN, UMMA::Major::MN>;
+using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+
+using FI_TileShape    = Shape<_64, _128, _128>;
+using FI_ClusterShape = Shape<_1, _1, _1>;
+using FI_KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100;
+using FI_EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+using FI_ElementD = float;
+using FI_LayoutD  = cutlass::layout::RowMajor;
+static constexpr int FI_AlignmentD = 128 / cutlass::sizeof_bits<FI_ElementD>::value;
+using FI_FusionOp = cutlass::epilogue::fusion::LinearCombination<FI_ElementD, ElementAccumulator>;
+
+using FI_CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    FI_TileShape, FI_ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    void, void*, 0,
+    FI_ElementD, FI_LayoutD*, FI_AlignmentD,
+    FI_EpilogueSchedule, FI_FusionOp
+>::CollectiveOp;
+
+using FI_CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementAB, cute::tuple<LayoutA*, LayoutSFA*>, AlignmentAB,
+    ElementAB, cute::tuple<LayoutB*, LayoutSFB*>, AlignmentAB,
+    ElementAccumulator,
+    FI_TileShape, FI_ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename FI_CollectiveEpilogue::SharedStorage))>,
+    FI_KernelSchedule
+>::CollectiveOp;
+
+using FI_GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    ProblemShape, FI_CollectiveMainloop, FI_CollectiveEpilogue>;
+using FI_Gemm = cutlass::gemm::device::GemmUniversalAdapter<FI_GemmKernel>;
+
+using FI_StrideA = typename FI_Gemm::GemmKernel::InternalStrideA;
+using FI_StrideB = typename FI_Gemm::GemmKernel::InternalStrideB;
+using FI_StrideD = typename FI_Gemm::GemmKernel::InternalStrideD;
+
+}  // namespace fi_gemm_m64
 
 // Pointer setup kernel with Programmatic Dependent Launch (PDL)
 __global__ void setup_fi_gemm_args(
@@ -307,6 +363,52 @@ __global__ void setup_fi_gemm_args(
 
     // MN-major SFB: [num_groups, K//128, N//128] — expert i block
     layout_SFB[i] = fi_gemm::ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+    SFB_ptr[i]    = SFB + (int64_t)i * sf_n * sf_k;
+}
+
+// M=64 variant: SFA pointer steps by m_offset/64 (M-tiles) instead of m_offset (tokens).
+// Requires m_indptr values to be multiples of 64.
+__global__ void setup_fi_gemm_m64_args(
+    ElementAB* A, ElementAB* B, float* SFA, float* SFB, float* D,
+    int* m_indptr, int max_m, int n, int k, int num_groups,
+    ProblemShape::UnderlyingProblemShape* problem_sizes,
+    const ElementAB** A_ptr, const ElementAB** B_ptr,
+    const float** SFA_ptr, const float** SFB_ptr,
+    float** D_ptr,
+    fi_gemm_m64::FI_StrideA* stride_A, fi_gemm_m64::FI_StrideB* stride_B,
+    fi_gemm_m64::FI_StrideD* stride_D,
+    fi_gemm_m64::LayoutSFA* layout_SFA, fi_gemm_m64::LayoutSFB* layout_SFB
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_groups) return;
+
+    int sf_n = n / 128;
+    int sf_k = k / 128;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+
+    int m_offset = m_indptr[i];
+    int m_next   = m_indptr[i + 1];
+    int m = m_next - m_offset;
+
+    problem_sizes[i] = ProblemShape::UnderlyingProblemShape(m, n, k);
+    stride_A[i] = fi_gemm_m64::FI_StrideA{k, cute::Int<1>{}, cute::Int<0>{}};
+    stride_B[i] = fi_gemm_m64::FI_StrideB{k, cute::Int<1>{}, cute::Int<0>{}};
+    stride_D[i] = fi_gemm_m64::FI_StrideD{n, cute::Int<1>{}, cute::Int<0>{}};
+
+    A_ptr[i] = A + (int64_t)m_offset * k;
+    B_ptr[i] = B + (int64_t)i * n * k;
+    D_ptr[i] = D + (int64_t)m_offset * n;
+
+    // MN-major SFA with M=64 granularity: [K//128, max_m//64] global layout.
+    // Each group starts at M-tile index m_offset/64.
+    layout_SFA[i] = fi_gemm_m64::ScaleConfig::tile_atom_to_shape_SFA(make_shape(max_m, n, k, 1));
+    SFA_ptr[i]    = SFA + m_offset / 64;
+
+    layout_SFB[i] = fi_gemm_m64::ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
     SFB_ptr[i]    = SFB + (int64_t)i * sf_n * sf_k;
 }
 
@@ -836,6 +938,133 @@ void cutlass_moe_gemm_fp8_blockwise(
     status = gemm_op.run(stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/true);
     TORCH_CHECK(status == cutlass::Status::kSuccess,
                 "CUTLASS SM100 FP8 blockwise run failed: status=", (int)status);
+
+#else
+    TORCH_CHECK(false, "CUTLASS SM100 not supported — compile with -arch=sm_100a");
+#endif
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// M=64 tile-granularity FP8 Blockwise Grouped GEMM — GEMM2 entry point.
+// SFA layout: [K//128, cum_m//64] col-major (vs [K//128, cum_m] for M=1).
+// cum_m must be a multiple of 64 (guaranteed by launch_compute_offsets padding).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void cutlass_moe_gemm_fp8_m64_blockwise(
+    torch::Tensor& output,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& SFA,       // [K//128, cum_m//64] fp32
+    torch::Tensor const& SFB,       // [num_groups, K//128, N//128] fp32
+    torch::Tensor const& m_indptr,  // [num_groups+1] int32 (multiples of 64)
+    int num_groups
+) {
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    auto stream = at::cuda::getCurrentCUDAStream(A.device().index());
+    auto dev = A.device();
+    int cum_m = A.size(0);
+    int n = B.size(1);
+    int k = B.size(2);
+    int max_m = cum_m;
+
+    auto opts_byte = torch::dtype(torch::kByte).device(dev);
+
+    auto d_problem_sizes = torch::empty(
+        {(int64_t)(num_groups * sizeof(ProblemShape::UnderlyingProblemShape))}, opts_byte);
+    auto d_a_ptrs   = torch::empty({(int64_t)(num_groups * sizeof(void*))}, opts_byte);
+    auto d_b_ptrs   = torch::empty({(int64_t)(num_groups * sizeof(void*))}, opts_byte);
+    auto d_d_ptrs   = torch::empty({(int64_t)(num_groups * sizeof(void*))}, opts_byte);
+    auto d_sfa_ptrs = torch::empty({(int64_t)(num_groups * sizeof(void*))}, opts_byte);
+    auto d_sfb_ptrs = torch::empty({(int64_t)(num_groups * sizeof(void*))}, opts_byte);
+    auto d_stride_a   = torch::empty({(int64_t)(num_groups * sizeof(fi_gemm_m64::FI_StrideA))}, opts_byte);
+    auto d_stride_b   = torch::empty({(int64_t)(num_groups * sizeof(fi_gemm_m64::FI_StrideB))}, opts_byte);
+    auto d_stride_d   = torch::empty({(int64_t)(num_groups * sizeof(fi_gemm_m64::FI_StrideD))}, opts_byte);
+    auto d_layout_sfa = torch::empty({(int64_t)(num_groups * sizeof(fi_gemm_m64::LayoutSFA))}, opts_byte);
+    auto d_layout_sfb = torch::empty({(int64_t)(num_groups * sizeof(fi_gemm_m64::LayoutSFB))}, opts_byte);
+
+    {
+        int threads = std::min(num_groups, 1024);
+        int blocks  = (num_groups + threads - 1) / threads;
+        cudaLaunchConfig_t config = {};
+        config.gridDim  = blocks;
+        config.blockDim = threads;
+        config.dynamicSmemBytes = 0;
+        config.stream   = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = true;
+        config.numAttrs = 1;
+        config.attrs    = attrs;
+        CUDA_CHECK(cudaLaunchKernelEx(
+            &config, setup_fi_gemm_m64_args,
+            reinterpret_cast<ElementAB*>(A.data_ptr()),
+            reinterpret_cast<ElementAB*>(B.data_ptr()),
+            static_cast<float*>(SFA.data_ptr()),
+            static_cast<float*>(SFB.data_ptr()),
+            static_cast<float*>(output.data_ptr()),
+            static_cast<int*>(m_indptr.data_ptr()),
+            max_m, n, k, num_groups,
+            reinterpret_cast<ProblemShape::UnderlyingProblemShape*>(d_problem_sizes.data_ptr()),
+            reinterpret_cast<const ElementAB**>(d_a_ptrs.data_ptr()),
+            reinterpret_cast<const ElementAB**>(d_b_ptrs.data_ptr()),
+            reinterpret_cast<const float**>(d_sfa_ptrs.data_ptr()),
+            reinterpret_cast<const float**>(d_sfb_ptrs.data_ptr()),
+            reinterpret_cast<float**>(d_d_ptrs.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::FI_StrideA*>(d_stride_a.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::FI_StrideB*>(d_stride_b.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::FI_StrideD*>(d_stride_d.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::LayoutSFA*>(d_layout_sfa.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::LayoutSFB*>(d_layout_sfb.data_ptr())
+        ));
+    }
+
+    int device_id = dev.index();
+    cutlass::KernelHardwareInfo hw_info{
+        device_id,
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device_id)
+    };
+
+    typename fi_gemm_m64::FI_Gemm::GemmKernel::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {num_groups,
+         reinterpret_cast<ProblemShape::UnderlyingProblemShape*>(d_problem_sizes.data_ptr()),
+         /*host=*/nullptr},
+        {
+            reinterpret_cast<const ElementAB**>(d_a_ptrs.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::FI_StrideA*>(d_stride_a.data_ptr()),
+            reinterpret_cast<const ElementAB**>(d_b_ptrs.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::FI_StrideB*>(d_stride_b.data_ptr()),
+            reinterpret_cast<const float**>(d_sfa_ptrs.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::LayoutSFA*>(d_layout_sfa.data_ptr()),
+            reinterpret_cast<const float**>(d_sfb_ptrs.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::LayoutSFB*>(d_layout_sfb.data_ptr()),
+        },
+        {
+            {},
+            nullptr, nullptr,
+            reinterpret_cast<float**>(d_d_ptrs.data_ptr()),
+            reinterpret_cast<fi_gemm_m64::FI_StrideD*>(d_stride_d.data_ptr()),
+        },
+        hw_info
+    };
+    args.epilogue.thread.alpha = 1.0f;
+    args.epilogue.thread.beta  = 0.0f;
+
+    fi_gemm_m64::FI_Gemm gemm_op;
+    auto can_impl = gemm_op.can_implement(args);
+    TORCH_CHECK(can_impl == cutlass::Status::kSuccess,
+                "CUTLASS SM100 FP8 m64 cannot implement: status=", (int)can_impl);
+
+    size_t workspace_size = fi_gemm_m64::FI_Gemm::get_workspace_size(args);
+    auto workspace = torch::empty({(int64_t)workspace_size}, opts_byte);
+
+    auto status = gemm_op.initialize(args, workspace.data_ptr<uint8_t>());
+    TORCH_CHECK(status == cutlass::Status::kSuccess,
+                "CUTLASS SM100 FP8 m64 init failed: status=", (int)status);
+
+    status = gemm_op.run(stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/true);
+    TORCH_CHECK(status == cutlass::Status::kSuccess,
+                "CUTLASS SM100 FP8 m64 run failed: status=", (int)status);
 
 #else
     TORCH_CHECK(false, "CUTLASS SM100 not supported — compile with -arch=sm_100a");
