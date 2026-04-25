@@ -278,7 +278,10 @@ using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
 using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
 using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
-using FI_TileShape    = Shape<_64, _128, _128>;
+// tile_M=128 for fi_gemm_m64: halves the number of CTAs (100K → 50K at
+// seq=14107), reducing per-tile launch/setup overhead. M=64 scale granularity
+// still applies — each tile has 2 row-scales (top/bottom 64 rows).
+using FI_TileShape    = Shape<_128, _128, _128>;
 using FI_ClusterShape = Shape<_1, _1, _1>;
 using FI_KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100;
 using FI_EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
