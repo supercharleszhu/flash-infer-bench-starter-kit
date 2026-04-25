@@ -658,6 +658,39 @@ void launch_accumulate_weighted_add(
 // padded_token_wts (routing weight / 0.0 padding).
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Single kernel to initialize all 4 padded arrays with sentinels. Replaces
+// 4 torch.full/zeros calls (saves ~45µs of launch overhead per forward).
+// The build_padded_arrays_kernel then overwrites the [0, padded_total) range
+// with real values; this init covers [padded_total, max_padded).
+__global__ void init_padded_arrays_kernel(
+    int max_padded, int T_sentinel,
+    int*   __restrict__ padded_token_ids,
+    int*   __restrict__ padded_safe_ids,
+    float* __restrict__ padded_valid,
+    float* __restrict__ padded_token_wts)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= max_padded) return;
+    padded_token_ids[i] = T_sentinel;
+    padded_safe_ids[i] = 0;
+    padded_valid[i] = 0.0f;
+    padded_token_wts[i] = 0.0f;
+}
+
+void launch_init_padded_arrays(
+    int max_padded, int T_sentinel,
+    int* padded_token_ids, int* padded_safe_ids,
+    float* padded_valid, float* padded_token_wts,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (max_padded + threads - 1) / threads;
+    init_padded_arrays_kernel<<<blocks, threads, 0, stream>>>(
+        max_padded, T_sentinel,
+        padded_token_ids, padded_safe_ids, padded_valid, padded_token_wts);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void build_padded_arrays_kernel(
     const int*   __restrict__ unpadded_offsets, // [E+1] int32 cumulative
     const int*   __restrict__ padded_offsets,   // [E+1] int32 cumulative

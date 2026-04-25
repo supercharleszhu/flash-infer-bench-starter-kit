@@ -169,6 +169,15 @@ void launch_accumulate_weighted_add(
     float* __restrict__ output,         // [T, H]
     cudaStream_t stream);
 
+// 8c0) Single-launch initializer for the 4 padded arrays (replaces 4 torch
+// fills). Sets sentinel values across all max_padded slots; build_padded then
+// overwrites the real region.
+void launch_init_padded_arrays(
+    int max_padded, int T_sentinel,
+    int* padded_token_ids, int* padded_safe_ids,
+    float* padded_valid, float* padded_token_wts,
+    cudaStream_t stream);
+
 // 8c) Build padded arrays on GPU (eliminates .cpu() syncs in main.cpp).
 // Inputs are GPU arrays; outputs are GPU arrays of size padded_offsets[E_local].
 void launch_build_padded_arrays(

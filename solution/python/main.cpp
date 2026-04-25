@@ -120,15 +120,12 @@ void run(
         d_padded_offsets.data_ptr<int>(),
         stream, pad_align);
 
-    // Allocate at worst-case, padded_token_ids defaults to T (sentinel) so
-    // unused rows are skipped by every downstream kernel. token_wts defaults
-    // to 0.0 for the same reason.
     auto token_ids = torch::empty({max_assign}, torch::dtype(torch::kInt32).device(dev));
     auto token_wts = torch::empty({max_assign}, torch::dtype(torch::kFloat32).device(dev));
-    // Inverse map (token, k) → padded_slot, used by non-atomic finalize.
-    // Init to -1 (sentinel) so non-local (t,k) pairs are skipped.
-    auto inv_slot = torch::full({(int64_t)T * ROUTE_TOP_K}, -1,
-                                torch::dtype(torch::kInt32).device(dev));
+    // inv_slot: fill_local_assignments_with_inverse writes to EVERY (t,k) slot
+    // (-1 for non-local) — no prior init needed.
+    auto inv_slot = torch::empty({(int64_t)T * ROUTE_TOP_K},
+                                  torch::dtype(torch::kInt32).device(dev));
     launch_fill_local_assignments_with_inverse(
         topk_idx.data_ptr<int>(), topk_w.data_ptr<float>(),
         (int)T, (int)local_expert_offset,
@@ -140,15 +137,18 @@ void run(
         stream);
 
     // ── 3. Build padded layout (all on GPU) ──
-    // Sentinel-fill so slots in [padded_total, max_padded) are auto-skipped:
-    //   padded_token_ids = T (out-of-bounds → scatter skip)
-    //   padded_token_wts = 0 (zero weight → scatter skip)
-    //   padded_valid     = 0 (masks SFA gather column)
-    auto padded_token_ids = torch::full({max_padded}, (int32_t)T,
-                                          torch::dtype(torch::kInt32).device(dev));
-    auto padded_safe_ids  = torch::zeros({max_padded}, torch::dtype(torch::kInt32).device(dev));
-    auto padded_valid     = torch::zeros({max_padded}, torch::dtype(torch::kFloat32).device(dev));
-    auto padded_token_wts = torch::zeros({max_padded}, torch::dtype(torch::kFloat32).device(dev));
+    // Single-launch initializer for sentinel values (replaces 4 torch fills,
+    // saves ~45µs of launch overhead). build_padded_arrays overwrites the
+    // [0, padded_total) range with real values.
+    auto padded_token_ids = torch::empty({max_padded}, torch::dtype(torch::kInt32).device(dev));
+    auto padded_safe_ids  = torch::empty({max_padded}, torch::dtype(torch::kInt32).device(dev));
+    auto padded_valid     = torch::empty({max_padded}, torch::dtype(torch::kFloat32).device(dev));
+    auto padded_token_wts = torch::empty({max_padded}, torch::dtype(torch::kFloat32).device(dev));
+    launch_init_padded_arrays(
+        max_padded, (int)T,
+        padded_token_ids.data_ptr<int>(), padded_safe_ids.data_ptr<int>(),
+        padded_valid.data_ptr<float>(), padded_token_wts.data_ptr<float>(),
+        stream);
     launch_build_padded_arrays(
         d_unpadded_offsets.data_ptr<int>(),
         d_padded_offsets.data_ptr<int>(),
