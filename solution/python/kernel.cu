@@ -191,6 +191,36 @@ __global__ void noaux_routing_topk8_kernel(
   }
 }
 
+// Fused SFA preparation: replaces 4 torch ops (cast int32→int64, index_select,
+// contiguous, mul_) with a single kernel. Output: sfa[kb, i] = hs_scale[kb, safe_ids[i]] * valid_mask[i]
+__global__ void prepare_sfa_kernel(
+    const float* __restrict__ hs_scale,   // [K_blocks, T] row-major
+    const int*   __restrict__ safe_ids,   // [padded_total]
+    const float* __restrict__ valid_mask, // [padded_total]
+    int T, int padded_total, int K_blocks,
+    float*       __restrict__ sfa)        // [K_blocks, padded_total] row-major
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int kb = blockIdx.y;
+    if (i >= padded_total || kb >= K_blocks) return;
+    int sid = safe_ids[i];
+    float v = valid_mask[i];
+    float s = hs_scale[(size_t)kb * T + sid];
+    sfa[(size_t)kb * padded_total + i] = s * v;
+}
+
+void launch_prepare_sfa(
+    const float* hs_scale, const int* safe_ids, const float* valid_mask,
+    int T, int padded_total, int K_blocks,
+    float* sfa, cudaStream_t stream)
+{
+    dim3 block(128);
+    dim3 grid((padded_total + block.x - 1) / block.x, K_blocks);
+    prepare_sfa_kernel<<<grid, block, 0, stream>>>(
+        hs_scale, safe_ids, valid_mask, T, padded_total, K_blocks, sfa);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // 2) Hidden block scale application (in-place)
 __global__ void apply_hidden_block_scale_kernel(
     float* __restrict__ A,            // [T, H]
@@ -764,15 +794,64 @@ __global__ void finalize_weighted_bf16_kernel(
     *out_pair = __floats2bfloat162_rn(acc0, acc1);
 }
 
+// BF16-input variant: GEMM2 with FI_ElementD=bfloat16_t outputs bf16, halving
+// this kernel's read bandwidth (3.16GB → 1.58GB at seq=14107).
+__global__ void finalize_weighted_bf16_from_bf16_kernel(
+    const __nv_bfloat16* __restrict__ gemm2_out,    // [N, H] bf16
+    const int*           __restrict__ inv_slot,     // [T, topK]
+    const float*         __restrict__ topk_weights, // [T, topK]
+    int H,
+    __nv_bfloat16*       __restrict__ output)       // [T, H]
+{
+    int t    = blockIdx.y;
+    int col2 = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (col2 >= H) return;
+
+    int   slots[ROUTE_TOP_K];
+    float wts[ROUTE_TOP_K];
+    #pragma unroll
+    for (int k = 0; k < ROUTE_TOP_K; k++) {
+        slots[k] = inv_slot[t * ROUTE_TOP_K + k];
+        wts[k]   = topk_weights[t * ROUTE_TOP_K + k];
+    }
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < ROUTE_TOP_K; k++) {
+        if (slots[k] < 0) continue;
+        // bf16x2 vectorized load (one LD.32 fetches 2 bf16 values).
+        auto* row = reinterpret_cast<const __nv_bfloat162*>(
+            gemm2_out + (size_t)slots[k] * H + col2);
+        __nv_bfloat162 v = *row;
+        acc0 += wts[k] * __bfloat162float(v.x);
+        acc1 += wts[k] * __bfloat162float(v.y);
+    }
+
+    auto* out_pair = reinterpret_cast<__nv_bfloat162*>(output + (size_t)t * H + col2);
+    *out_pair = __floats2bfloat162_rn(acc0, acc1);
+}
+
 void launch_finalize_weighted_bf16(
     const float* gemm2_out, const int* inv_slot, const float* topk_weights,
     int T, int H, __nv_bfloat16* output, cudaStream_t stream)
 {
-    // Each thread handles 2 cols (bf16x2). H must be even (DeepSeek H=7168).
     dim3 block(256);
     dim3 grid(((H / 2) + block.x - 1) / block.x, T);
     if (T > 0) {
         finalize_weighted_bf16_kernel<<<grid, block, 0, stream>>>(
+            gemm2_out, inv_slot, topk_weights, H, output);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void launch_finalize_weighted_bf16_from_bf16(
+    const __nv_bfloat16* gemm2_out, const int* inv_slot, const float* topk_weights,
+    int T, int H, __nv_bfloat16* output, cudaStream_t stream)
+{
+    dim3 block(256);
+    dim3 grid(((H / 2) + block.x - 1) / block.x, T);
+    if (T > 0) {
+        finalize_weighted_bf16_from_bf16_kernel<<<grid, block, 0, stream>>>(
             gemm2_out, inv_slot, topk_weights, H, output);
         CUDA_CHECK(cudaGetLastError());
     }

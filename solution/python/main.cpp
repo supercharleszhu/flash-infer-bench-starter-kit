@@ -178,11 +178,17 @@ void run(
     auto sorted_act_fp8 = torch::from_blob(sorted_act_fp8_raw.data_ptr(),
         {padded_total, HIDDEN_SIZE}, torch::dtype(torch::kFloat8_e4m3fn).device(dev));
 
-    // Single SFA gather via index_select using safe ids, mask zero padding cols.
+    // Fused SFA prep — replaces 4 torch ops (cast/index_select/contiguous/mul_).
     int64_t K_blocks = HIDDEN_SIZE / 128;
-    auto hs_scale_cont = hidden_states_scale.contiguous();  // [K_blocks, T]
-    auto sfa = hs_scale_cont.index_select(1, padded_safe_ids.to(torch::kLong)).contiguous();
-    sfa.mul_(padded_valid.unsqueeze(0));  // zero padding columns
+    auto hs_scale_cont = hidden_states_scale.contiguous();  // [K_blocks, T] (no-op if already)
+    auto sfa = torch::empty({K_blocks, padded_total},
+                              torch::dtype(torch::kFloat32).device(dev));
+    launch_prepare_sfa(
+        hs_scale_cont.data_ptr<float>(),
+        padded_safe_ids.data_ptr<int>(),
+        padded_valid.data_ptr<float>(),
+        (int)T, padded_total, (int)K_blocks,
+        sfa.data_ptr<float>(), stream);
 
     // SFB: permute from [E, N/128, K/128] to [E, K/128, N/128] (MN-major)
     auto sfb = gemm1_weights_scale.permute({0, 2, 1}).contiguous();
@@ -213,9 +219,6 @@ void run(
                                         torch::dtype(torch::kUInt8).device(dev));
     auto sfb_g2 = gemm2_weights_scale.permute({0, 2, 1}).contiguous();
 
-    auto gemm2_out = torch::empty({padded_total, HIDDEN_SIZE},
-                                   torch::dtype(torch::kFloat32).device(dev));
-
     if (large_seq) {
         auto swiglu_scales = torch::empty({INTERMEDIATE_SIZE / 128, padded_total / 64},
                                            torch::dtype(torch::kFloat32).device(dev));
@@ -225,29 +228,11 @@ void run(
             swiglu_scales.data_ptr<float>(), stream);
         auto swiglu_fp8 = torch::from_blob(swiglu_fp8_raw.data_ptr(),
             {padded_total, INTERMEDIATE_SIZE}, torch::dtype(torch::kFloat8_e4m3fn).device(dev));
+        auto gemm2_out = torch::empty({padded_total, HIDDEN_SIZE},
+                                       torch::dtype(torch::kFloat32).device(dev));
         cutlass_moe_gemm_fp8_m64_blockwise(
             gemm2_out, swiglu_fp8, gemm2_weights,
             swiglu_scales, sfb_g2, d_padded_offsets, NUM_LOCAL_EXPERTS);
-    } else {
-        auto swiglu_scales = torch::empty({INTERMEDIATE_SIZE / 128, padded_total},
-                                           torch::dtype(torch::kFloat32).device(dev));
-        launch_swiglu_quantize_fp8(
-            gemm1_out.data_ptr<float>(), padded_total,
-            swiglu_fp8_raw.data_ptr<uint8_t>(),
-            swiglu_scales.data_ptr<float>(), stream);
-        auto swiglu_fp8 = torch::from_blob(swiglu_fp8_raw.data_ptr(),
-            {padded_total, INTERMEDIATE_SIZE}, torch::dtype(torch::kFloat8_e4m3fn).device(dev));
-        cutlass_moe_gemm_fp8_blockwise(
-            gemm2_out, swiglu_fp8, gemm2_weights,
-            swiglu_scales, sfb_g2, d_padded_offsets, NUM_LOCAL_EXPERTS);
-    }
-
-    // ── 8. Output reduction ──
-    // Large seq: non-atomic finalize (per-token gather of topK rows + weighted sum).
-    //   Replaces atomic scatter at seq=14107: 1.65ms → 0.4ms (saves 1.2ms).
-    // Small seq: atomic scatter — the atomic contention is small enough that
-    //   the gather-finalize launch overhead dominates and finalize is slower.
-    if (large_seq) {
         launch_finalize_weighted_bf16(
             gemm2_out.data_ptr<float>(),
             inv_slot.data_ptr<int>(),
@@ -256,6 +241,20 @@ void run(
             reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
             stream);
     } else {
+        // Small seq: cutlass_v2-equivalent path (FP32 GEMM2 + atomic scatter).
+        auto swiglu_scales = torch::empty({INTERMEDIATE_SIZE / 128, padded_total},
+                                           torch::dtype(torch::kFloat32).device(dev));
+        launch_swiglu_quantize_fp8(
+            gemm1_out.data_ptr<float>(), padded_total,
+            swiglu_fp8_raw.data_ptr<uint8_t>(),
+            swiglu_scales.data_ptr<float>(), stream);
+        auto swiglu_fp8 = torch::from_blob(swiglu_fp8_raw.data_ptr(),
+            {padded_total, INTERMEDIATE_SIZE}, torch::dtype(torch::kFloat8_e4m3fn).device(dev));
+        auto gemm2_out = torch::empty({padded_total, HIDDEN_SIZE},
+                                       torch::dtype(torch::kFloat32).device(dev));
+        cutlass_moe_gemm_fp8_blockwise(
+            gemm2_out, swiglu_fp8, gemm2_weights,
+            swiglu_scales, sfb_g2, d_padded_offsets, NUM_LOCAL_EXPERTS);
         output.zero_();
         launch_scatter_weighted_bf16_atomic(
             gemm2_out.data_ptr<float>(),

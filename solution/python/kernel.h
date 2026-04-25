@@ -45,6 +45,17 @@ void launch_noaux_routing_topk8(
     float* __restrict__ topk_w,    // [T, 8] (float32)
     cudaStream_t stream);
 
+// 1c) Fused SFA preparation: gathers + masks per-token A scales for GEMM1.
+// Replaces 4 torch ops (int32→int64 cast, index_select, contiguous, mul_) with
+// a single kernel — saves ~0.15ms of torch dispatch overhead per call.
+void launch_prepare_sfa(
+    const float* hs_scale,   // [K_blocks, T] row-major
+    const int* safe_ids,     // [padded_total]
+    const float* valid_mask, // [padded_total]
+    int T, int padded_total, int K_blocks,
+    float* sfa,              // [K_blocks, padded_total] row-major
+    cudaStream_t stream);
+
 // 2) Hidden states block-scale application (after FP8 -> float32 conversion)
 void launch_apply_hidden_block_scale(
     float* __restrict__ A_fp32,     // [T, H], in-place
@@ -211,6 +222,16 @@ void launch_finalize_weighted_bf16(
     const float* __restrict__ topk_weights, // [T, topK]
     int T, int H,
     __nv_bfloat16* __restrict__ output,     // [T, H] bf16 (no zero-init needed — overwrite)
+    cudaStream_t stream);
+
+// 8g) BF16-input variant of 8f. Used when GEMM2 outputs bf16 directly
+// (large-seq path with fi_gemm_m64 BF16 epilogue). Halves read bandwidth.
+void launch_finalize_weighted_bf16_from_bf16(
+    const __nv_bfloat16* __restrict__ gemm2_out,
+    const int* __restrict__ inv_slot,
+    const float* __restrict__ topk_weights,
+    int T, int H,
+    __nv_bfloat16* __restrict__ output,
     cudaStream_t stream);
 
 // 9a) Fused FP8 dequant to BF16 (half bandwidth vs FP32)
