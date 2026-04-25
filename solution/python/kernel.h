@@ -35,12 +35,16 @@ static constexpr int ROUTE_TOPK_GROUP = 4;
 
 // Kernel launchers
 
-// 1) No-aux routing with group-top2 and global top-k=8
+// 1) No-aux routing with group-top2 and global top-k=8.
+// Fused: also increments per-local-expert counts (saves a separate count kernel).
+// Pass counts=nullptr to skip the counting step.
 void launch_noaux_routing_topk8(
     const float* routing_logits,   // [T, 256]
     const float* routing_bias,     // [256] (float32)
     int T,                         // seq_len
     float routed_scaling_factor,
+    int local_expert_offset,
+    int* counts,                   // [E_local] zeroed; nullptr to skip
     int* __restrict__ topk_idx,    // [T, 8] (int32)
     float* __restrict__ topk_w,    // [T, 8] (float32)
     cudaStream_t stream);

@@ -58,6 +58,8 @@ __global__ void noaux_routing_topk8_kernel(
     const float* __restrict__ bias,     // [256]
     int T,
     float routed_scaling_factor,
+    int local_expert_offset,            // for fused count
+    int* __restrict__ counts,           // [E_local] (nullptr to skip)
     int* __restrict__ topk_idx,         // [T, 8]
     float* __restrict__ topk_w) {       // [T, 8]
 
@@ -183,9 +185,15 @@ __global__ void noaux_routing_topk8_kernel(
       sumw = fmaxf(sumw, 1e-20f);
       #pragma unroll
       for (int j = 0; j < ROUTE_TOP_K; ++j) {
+        int e = sel_idx_sh[j];
         float w = (sel_s_sh[j] / sumw) * routed_scaling_factor;
-        topk_idx[t * ROUTE_TOP_K + j] = sel_idx_sh[j];
+        topk_idx[t * ROUTE_TOP_K + j] = e;
         topk_w  [t * ROUTE_TOP_K + j] = w;
+        // Fused count: increment local expert counter if this assignment is local.
+        if (counts != nullptr) {
+          int le = e - local_expert_offset;
+          if ((unsigned)le < (unsigned)NUM_LOCAL_EXPERTS) atomicAdd(&counts[le], 1);
+        }
       }
     }
   }
@@ -545,6 +553,8 @@ void launch_noaux_routing_topk8(
     const float* routing_bias,
     int T,
     float routed_scaling_factor,
+    int local_expert_offset,
+    int* counts,
     int* topk_idx,
     float* topk_w,
     cudaStream_t stream) {
@@ -552,7 +562,8 @@ void launch_noaux_routing_topk8(
   dim3 block(ROUTE_NUM_GROUP * 32); // 8 warps
   dim3 grid(T);
   noaux_routing_topk8_kernel<<<grid, block, 0, stream>>>(
-      routing_logits, routing_bias, T, routed_scaling_factor, topk_idx, topk_w);
+      routing_logits, routing_bias, T, routed_scaling_factor,
+      local_expert_offset, counts, topk_idx, topk_w);
   CUDA_CHECK(cudaGetLastError());
 }
 

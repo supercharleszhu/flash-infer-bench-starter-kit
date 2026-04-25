@@ -82,14 +82,17 @@ void run(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     auto dev = routing_logits.device();
 
-    // ── 1. Routing ──
+    // ── 1. Routing (fused with count_local_assignments) ──
     auto routing_bias_f32 = routing_bias.to(torch::kFloat32).contiguous();
     auto topk_idx = torch::empty({T, ROUTE_TOP_K}, torch::dtype(torch::kInt32).device(dev));
-    auto topk_w = torch::empty({T, ROUTE_TOP_K}, torch::dtype(torch::kFloat32).device(dev));
+    auto topk_w   = torch::empty({T, ROUTE_TOP_K}, torch::dtype(torch::kFloat32).device(dev));
+    auto counts   = torch::zeros({NUM_LOCAL_EXPERTS}, torch::dtype(torch::kInt32).device(dev));
     launch_noaux_routing_topk8(
         routing_logits.contiguous().data_ptr<float>(),
         routing_bias_f32.data_ptr<float>(),
         (int)T, static_cast<float>(routed_scaling_factor),
+        (int)local_expert_offset,
+        counts.data_ptr<int>(),
         topk_idx.data_ptr<int>(), topk_w.data_ptr<float>(), stream);
 
     // ── 2. Count local assignments + device-side prefix scan ──
@@ -105,11 +108,7 @@ void run(
     // Round max_padded up to a multiple of pad_align (required for SFA stride exactness).
     const int max_padded = (max_assign + pad_max_overhead + pad_align - 1) & ~(pad_align - 1);
 
-    auto counts = torch::zeros({NUM_LOCAL_EXPERTS}, torch::dtype(torch::kInt32).device(dev));
-    launch_count_local_assignments(
-        topk_idx.data_ptr<int>(), (int)T, (int)local_expert_offset,
-        counts.data_ptr<int>(), stream);
-
+    // counts already populated by the fused routing kernel above.
     auto d_unpadded_offsets = torch::empty({NUM_LOCAL_EXPERTS + 1}, torch::dtype(torch::kInt32).device(dev));
     auto d_fill_offsets     = torch::empty({NUM_LOCAL_EXPERTS + 1}, torch::dtype(torch::kInt32).device(dev));
     auto d_padded_offsets   = torch::empty({NUM_LOCAL_EXPERTS + 1}, torch::dtype(torch::kInt32).device(dev));
